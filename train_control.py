@@ -180,8 +180,10 @@ def main():
                        help='Percentage of training data to use (1-100)')
     parser.add_argument('--epochs', type=int, default=200,
                        help='Number of epochs to train')
-    parser.add_argument('--lr', type=float, default=0.1,
+    parser.add_argument('--lr', type=float, default=0.001,
                        help='Learning rate')
+    parser.add_argument('--weight-decay', type=float, default=5e-4,
+                       help='Weight decay (L2 penalty)')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed for reproducibility')
     parser.add_argument('--save-dir', type=str, default='./checkpoints',
@@ -209,8 +211,8 @@ def main():
     model = model.to(device)
     
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, 
-                         weight_decay=5e-4)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, 
+                          weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
     os.makedirs(args.save_dir, exist_ok=True)
