@@ -59,9 +59,9 @@ def load_datasets(data_percentage=100, seed=42):
     ])
     
     # Load datasets
-    trainset = datasets.CIFAR10(root='./data', train=True, download=True, 
+    trainset = datasets.CIFAR10(root='/scratch/scholar/kapur16/data/', train=True, download=True, 
                                transform=transform_train)
-    testset = datasets.CIFAR10(root='./data', train=False, download=True, 
+    testset = datasets.CIFAR10(root='/scratch/scholar/kapur16/data/', train=False, download=True, 
                               transform=transform_test)
     
     # Sample training data

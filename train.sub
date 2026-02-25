@@ -21,3 +21,4 @@ srun python train_control.py \
     --seed 42 \
     --save-dir ./checkpoints \
     --model-name control_model_25pct
+
