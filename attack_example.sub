@@ -1,0 +1,2 @@
+python shadow_attack.py --checkpoint-dir ./checkpoints/model1 --num_queries 1000 --num_blocks 3
+python shadow_attack.py --checkpoint-dir ./checkpoints/model1 --resume-from ./attacks/run_20260224_143052
