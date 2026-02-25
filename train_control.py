@@ -186,15 +186,25 @@ def main():
                        help='Weight decay (L2 penalty)')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed for reproducibility')
-    parser.add_argument('--save-dir', type=str, default='./checkpoints',
-                       help='Directory to save model and metadata')
-    parser.add_argument('--model-name', type=str, default='control_model',
+    parser.add_argument('--identifier', type=str, default=None,
+                       help='Identifier for this run (default: auto-generated from parameters)')
+    parser.add_argument('--model-name', type=str, default='model',
                        help='Name of the model checkpoint')
     
     args = parser.parse_args()
     
     if not (1 <= args.data_percentage <= 100):
         raise ValueError("data_percentage must be between 1 and 100")
+    
+    if args.identifier is None:
+        identifier = f"{int(args.data_percentage)}pct_seed{args.seed}"
+    else:
+        identifier = args.identifier
+    
+    checkpoint_dir = os.path.join('./checkpoints', identifier)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    print(f"Checkpoint directory: {checkpoint_dir}")
     
     # Setup
     device = setup_device()
@@ -215,8 +225,6 @@ def main():
                           weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
-    os.makedirs(args.save_dir, exist_ok=True)
-    
     print(f"\nTraining for {args.epochs} epochs...\n")
     best_test_acc = 0
     best_epoch = 0
@@ -233,19 +241,19 @@ def main():
         if test_acc > best_test_acc:
             best_test_acc = test_acc
             best_epoch = epoch + 1
-            model_path = os.path.join(args.save_dir, f"{args.model_name}_best.pth")
+            model_path = os.path.join(checkpoint_dir, f"{args.model_name}_best.pth")
             torch.save(model.state_dict(), model_path)
             print(f"  -> Saved best model (accuracy: {test_acc:.2f}%)")
     
-    final_model_path = os.path.join(args.save_dir, f"{args.model_name}_final.pth")
+    final_model_path = os.path.join(checkpoint_dir, f"{args.model_name}_final.pth")
     torch.save(model.state_dict(), final_model_path)
     
     print(f"\n{'='*60}")
-    save_training_metadata(args.save_dir, args.data_percentage, train_indices,
+    save_training_metadata(checkpoint_dir, args.data_percentage, train_indices,
                           best_test_acc, test_loss, args.epochs, args.seed)
     print(f"{'='*60}")
     
-    print(f"\nModel checkpoints saved to: {args.save_dir}")
+    print(f"\nModel checkpoints saved to: {checkpoint_dir}")
     print(f"  - Best model: {args.model_name}_best.pth")
     print(f"  - Final model: {args.model_name}_final.pth")
 
