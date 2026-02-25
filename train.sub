@@ -19,6 +19,6 @@ srun python train_control.py \
     --lr 0.001 \
     --weight-decay 5e-4 \
     --seed 42 \
-    --save-dir ./checkpoints \
+    --identifier 25pct_seed42 \
     --model-name control_model_25pct
 
