@@ -2,7 +2,7 @@
 #SBATCH -A gpu
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH -t 08:00:00
+#SBATCH -t 04:00:00
 #SBATCH -o logs/%x-%j.out
 
 echo "Running on compute node:"
@@ -15,13 +15,16 @@ mkdir -p attacks
 # Run shadow model membership inference attack
 srun python shadow_attack.py \
     --checkpoint-dir ./checkpoints/25pct_seed42 \
-    --num_queries 1000 \
+    --num_queries 100 \
     --num_shadow_models 16 \
     --num_blocks 3 \
     --member-percentage 0.5 \
-    --mcmc-steps 10000 \
-    --burn-in 2000
+    --mcmc-steps 200000 \
+    --burn-in 20000 \
+    --shadow-epochs 50 \
+    --confidence-threshold 0.999 \
+    --use-final-model
 
-# To resume from a previous attack run, use:
+# To resume from a previous attack
 # srun python shadow_attack.py \
 #     --resume-from ./attacks/run_YYYYMMDD_HHMMSS

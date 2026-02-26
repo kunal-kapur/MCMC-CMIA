@@ -15,10 +15,13 @@ mkdir -p checkpoints
 # Train control model with 25% data
 srun python train_control.py \
     --data-percentage 25 \
-    --epochs 200 \
-    --lr 0.001 \
+    --epochs 50 \
+    --optimizer sgd \
+    --lr 0.01 \
     --weight-decay 5e-4 \
+    --scheduler cosine \
+    --batch-size 128 \
     --seed 42 \
     --identifier 25pct_seed42 \
-    --model-name control_model_25pct
+    --model-name model
 

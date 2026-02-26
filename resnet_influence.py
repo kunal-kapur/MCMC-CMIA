@@ -123,9 +123,8 @@ class ResNet_Influence(nn.Module):
 
     def compute_last_layer_hessian(self, loader, device, damping=1e-4):
         """
-        Builds the exact empirical Hessian over the linear classifier.
-        H = (1/n) sum_i  (D_i - p_i p_i^T) ⊗ h_i h_i^T
-        where h_i are features and p_i are softmax probabilities.
+        Builds the exact empirical Hessian over the linear classifier (including bias).
+        H = (1/n) sum_i  (D_i - p_i p_i^T) ⊗ [h_i; 1] [h_i; 1]^T
         """
         self.eval()
         H = None
@@ -138,11 +137,13 @@ class ResNet_Influence(nn.Module):
 
                 for i in range(feats.size(0)):
                     h = feats[i] # [512]
+                    # Augment feature with 1 for bias term
+                    h_aug = torch.cat([h, torch.ones(1, device=device)])  # [513]
                     p = probs[i] # [C]
                     # Covariance of the softmax output
                     P_cov = torch.diag(p) - torch.outer(p, p)  # [C, C]
-                    # Kronecker product for Hessian
-                    contrib = torch.kron(P_cov, torch.outer(h, h))  # [C*512, C*512]
+                    # Kronecker product for Hessian (now includes bias)
+                    contrib = torch.kron(P_cov, torch.outer(h_aug, h_aug))  # [C*513, C*513]
                     H = contrib if H is None else H + contrib
                     n += 1
 
@@ -150,6 +151,7 @@ class ResNet_Influence(nn.Module):
         # Damping for numerical stability
         H += damping * torch.eye(H.size(0), device=device)
         return H
+
     
 
     def influence_score(self, x_train, y_train, x_test, y_test,
@@ -194,11 +196,12 @@ class ResNet_Influence(nn.Module):
 
             d_logits = probs - y_onehot            # [N, C]
             
-            grad_W = torch.einsum('ni,nj->nij', d_logits, all_feats) 
+            # Augment features with 1 for bias term
+            all_feats_aug = torch.cat([all_feats, torch.ones(N, 1, device=device)], dim=1)  # [N, 513]
             
-            grad_b = d_logits
-            
-            G = torch.cat([grad_W.reshape(N, -1), grad_b], dim=1)
+            # Compute gradient: d_logits ⊗ all_feats_aug for each sample
+            # Result should be [N, C*513] with structure matching Kronecker product
+            G = torch.einsum('nc,nf->ncf', d_logits, all_feats_aug).reshape(N, -1)  # [N, C*513]
         
         C = -(G @ H_inv @ G.T) / N  # The 1/N comes from the influence function definition
         
