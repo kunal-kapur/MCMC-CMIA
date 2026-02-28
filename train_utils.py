@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 import torchvision.datasets as datasets
+import numpy as np
 from global_variables import DATA_DIR, TRANSFORM_TRAIN, TRANSFORM_TEST
 
 
@@ -66,6 +67,93 @@ class TrainingConfig:
             )
         
         return cls.from_dict(metadata['training_config'])
+
+
+def save_checkpoint(checkpoint_path, epoch, model, optimizer, scheduler, 
+                    best_test_acc, train_indices, config, rng_states=None):
+    """
+    Save complete training checkpoint including RNG states.
+    
+    Args:
+        checkpoint_path: Path to save checkpoint
+        epoch: Current epoch number (0-indexed during training)
+        model: Model to save
+        optimizer: Optimizer state
+        scheduler: Learning rate scheduler (can be None)
+        best_test_acc: Best test accuracy so far
+        train_indices: Training indices used
+        config: TrainingConfig object
+        rng_states: Optional dict of RNG states (will be captured if None)
+    """
+    # Capture RNG states if not provided
+    if rng_states is None:
+        rng_states = {
+            'python': None,  # Python random.getstate() if needed
+            'numpy': np.random.get_state(),
+            'torch': torch.get_rng_state(),
+            'torch_cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        }
+    
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+        'best_test_acc': best_test_acc,
+        'train_indices': train_indices,
+        'config': config.to_dict(),
+        'rng_states': rng_states
+    }
+    
+    # Save to temporary file first, then rename (atomic operation)
+    temp_path = checkpoint_path + '.tmp'
+    torch.save(checkpoint, temp_path)
+    os.replace(temp_path, checkpoint_path)
+
+
+def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, device='cpu'):
+    """
+    Load training checkpoint and restore RNG states.
+    
+    Args:
+        checkpoint_path: Path to checkpoint file
+        model: Model to load state into
+        optimizer: Optimizer to load state into (optional)
+        scheduler: Scheduler to load state into (optional)
+        device: Device to map checkpoint to
+    
+    Returns:
+        Dict containing: epoch, best_test_acc, train_indices, config, loaded successfully
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    
+    # Load model state
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Load optimizer state if provided
+    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    # Load scheduler state if provided
+    if scheduler is not None and checkpoint['scheduler_state_dict'] is not None:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    # Restore RNG states
+    if 'rng_states' in checkpoint:
+        rng_states = checkpoint['rng_states']
+        if rng_states['numpy'] is not None:
+            np.random.set_state(rng_states['numpy'])
+        if rng_states['torch'] is not None:
+            torch.set_rng_state(rng_states['torch'])
+        if rng_states['torch_cuda'] is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(rng_states['torch_cuda'])
+    
+    return {
+        'epoch': checkpoint['epoch'],
+        'best_test_acc': checkpoint.get('best_test_acc', 0),
+        'train_indices': checkpoint.get('train_indices', None),
+        'config': TrainingConfig.from_dict(checkpoint['config']) if 'config' in checkpoint else None
+    }
 
 
 def create_optimizer(model, config):
@@ -205,9 +293,10 @@ def evaluate_model(model, test_loader, criterion, device):
 
 
 def train_model(model, train_indices, config, device, verbose=True, 
-                test_loader=None, save_best_callback=None):
+                test_loader=None, save_best_callback=None, checkpoint_dir=None,
+                resume_from=None):
     """
-    Complete training loop for a model.
+    Complete training loop for a model with checkpointing support.
     
     Args:
         model: Neural network model (already on device)
@@ -217,6 +306,8 @@ def train_model(model, train_indices, config, device, verbose=True,
         verbose: Whether to print epoch progress
         test_loader: Optional test DataLoader for validation
         save_best_callback: Optional function(epoch, test_acc) called when best model is achieved
+        checkpoint_dir: Directory to save checkpoints (saves every epoch if provided)
+        resume_from: Path to checkpoint file to resume from
     
     Returns:
         Tuple of (final_train_loss, final_train_acc, final_test_loss, final_test_acc)
@@ -236,15 +327,31 @@ def train_model(model, train_indices, config, device, verbose=True,
     optimizer = create_optimizer(model, config)
     scheduler = create_scheduler(optimizer, config)
     
-    # Training loop
+    # Initialize training state
+    start_epoch = 0
     best_test_acc = 0
     final_test_loss = None
     final_test_acc = None
     
-    for epoch in range(config.epochs):
+    # Resume from checkpoint if provided
+    if resume_from is not None and os.path.exists(resume_from):
+        if verbose:
+            print(f"Resuming training from checkpoint: {resume_from}")
+        checkpoint_data = load_checkpoint(resume_from, model, optimizer, scheduler, device)
+        start_epoch = checkpoint_data['epoch'] + 1  # Continue from next epoch
+        best_test_acc = checkpoint_data['best_test_acc']
+        if verbose:
+            print(f"Resuming from epoch {start_epoch}/{config.epochs}, best_acc={best_test_acc:.2f}%")
+    
+    # Create checkpoint directory if needed
+    if checkpoint_dir is not None:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Training loop
+    for epoch in range(start_epoch, config.epochs):
         train_loss, train_acc = train_one_epoch(
             model, train_loader, criterion, optimizer, device, 
-            verbose=(verbose and epoch == 0)  # Only show batch details for first epoch
+            verbose=(verbose and epoch == start_epoch)  # Only show batch details for first epoch
         )
         
         # Evaluate on test set if provided
@@ -266,6 +373,34 @@ def train_model(model, train_indices, config, device, verbose=True,
             if verbose and (epoch + 1) % 10 == 0:
                 print(f"Epoch [{epoch+1}/{config.epochs}] - Train Acc: {train_acc:.2f}%")
         
+        # Save checkpoint after each epoch
+        if checkpoint_dir is not None:
+            checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint_latest.pth')
+            save_checkpoint(
+                checkpoint_path=checkpoint_path,
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                best_test_acc=best_test_acc,
+                train_indices=train_indices,
+                config=config
+            )
+            
+            # Also save epoch-specific checkpoint every 10 epochs (optional, for safety)
+            if (epoch + 1) % 10 == 0:
+                epoch_checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth')
+                save_checkpoint(
+                    checkpoint_path=epoch_checkpoint_path,
+                    epoch=epoch,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    best_test_acc=best_test_acc,
+                    train_indices=train_indices,
+                    config=config
+                )
+        
         # Update learning rate
         if scheduler is not None:
             scheduler.step()
@@ -273,19 +408,22 @@ def train_model(model, train_indices, config, device, verbose=True,
     return train_loss, train_acc, final_test_loss, final_test_acc
 
 
-def train_shadow_model(model, train_indices, config, device):
+def train_shadow_model(model, train_indices, config, device, checkpoint_path=None):
     """
-    Train a shadow model (no test evaluation, no checkpointing).
+    Train a shadow model without per-epoch checkpointing.
+    Only saves the final model after complete training.
     
     Args:
         model: Neural network model (already on device)
         train_indices: List of training sample indices
         config: TrainingConfig object
         device: torch device
+        checkpoint_path: Optional path for final model save location (passed for info only)
     
     Returns:
         Trained model in eval mode
     """
+    # Train without per-epoch checkpointing
     train_model(
         model, 
         train_indices, 
@@ -293,7 +431,9 @@ def train_shadow_model(model, train_indices, config, device):
         device, 
         verbose=False,
         test_loader=None,
-        save_best_callback=None
+        save_best_callback=None,
+        checkpoint_dir=None,  # No per-epoch saves
+        resume_from=None
     )
     
     model.eval()

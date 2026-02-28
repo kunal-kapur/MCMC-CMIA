@@ -13,17 +13,20 @@ mkdir -p logs
 mkdir -p attacks
 
 # Run shadow model membership inference attack
-srun python shadow_attack.py \
+srun python -u shadow_attack.py \
     --checkpoint-dir ./checkpoints/25pct_seed42 \
-    --num_queries 100 \
-    --num_shadow_models 16 \
+    --num_queries 2000 \
+    --num_shadow_models 32 \
     --num_blocks 3 \
     --member-percentage 0.5 \
-    --mcmc-steps 200000 \
+    --mcmc-steps 300000 \
     --burn-in 20000 \
     --shadow-epochs 50 \
-    --confidence-threshold 0.999 \
+    --confidence-threshold 0.95 \
+    --prior-prob 0.5 \
+    --temperature 0.7 \
     --use-final-model
+
 
 # To resume from a previous attack
 # srun python shadow_attack.py \

@@ -69,10 +69,6 @@ class Bottleneck(nn.Module):
         out = F.relu(out)
         return out
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 
 class ResNet_Influence(nn.Module):
     def __init__(self, block, num_blocks, num_classes=10):
@@ -124,33 +120,47 @@ class ResNet_Influence(nn.Module):
     def compute_last_layer_hessian(self, loader, device, damping=1e-4):
         """
         Builds the exact empirical Hessian over the linear classifier (including bias).
-        H = (1/n) sum_i  (D_i - p_i p_i^T) ⊗ [h_i; 1] [h_i; 1]^T
+        Vectorized using einsum to run efficiently on A10 GPUs.
         """
         self.eval()
-        H = None
+        
+        # Dimensions: 10 classes, 513 features (512 + 1 for bias)
+        num_classes = self.num_classes
+        num_features = self.linear.in_features + 1
+        param_dim = num_classes * num_features
+        
+        # Initialize H on the GPU
+        H = torch.zeros((param_dim, param_dim), device=device)
         n = 0
+        
         with torch.no_grad():
             for x, y in loader:
                 x = x.to(device)
                 logits, feats = self.forward(x, return_features=True)
-                probs = torch.softmax(logits, dim=1) # [B, C]
-
-                for i in range(feats.size(0)):
-                    h = feats[i] # [512]
-                    # Augment feature with 1 for bias term
-                    h_aug = torch.cat([h, torch.ones(1, device=device)])  # [513]
-                    p = probs[i] # [C]
-                    # Covariance of the softmax output
-                    P_cov = torch.diag(p) - torch.outer(p, p)  # [C, C]
-                    # Kronecker product for Hessian (now includes bias)
-                    contrib = torch.kron(P_cov, torch.outer(h_aug, h_aug))  # [C*513, C*513]
-                    H = contrib if H is None else H + contrib
-                    n += 1
+                probs = torch.softmax(logits, dim=1)  # [B, C]
+                B = feats.size(0)
+                
+                # Augment features with 1 for bias term: [B, 513]
+                feats_aug = torch.cat([feats, torch.ones(B, 1, device=device)], dim=1)
+                
+                # 1. Compute P_cov for the entire batch at once: [B, C, C]
+                P_cov_batch = torch.diag_embed(probs) - torch.einsum('bi,bj->bij', probs, probs)
+                
+                # 2. Compute the batched Kronecker product and sum over the batch dimension
+                # 'bij' is the [B, C, C] class covariance
+                # 'bk' and 'bl' are the [B, F] augmented features
+                # Resulting shape 'ikjl' directly maps to the Kronecker layout [C, F, C, F]
+                H_batch = torch.einsum('bij,bk,bl->ikjl', P_cov_batch, feats_aug, feats_aug)
+                
+                # Reshape to [C*F, C*F] and accumulate
+                H += H_batch.reshape(param_dim, param_dim)
+                n += B
 
         H = H / n
         # Damping for numerical stability
         H += damping * torch.eye(H.size(0), device=device)
         return H
+
 
     
 
@@ -165,7 +175,7 @@ class ResNet_Influence(nn.Module):
         g_test  = self.get_last_layer_grad(x_test,  y_test,  criterion)
         return -(g_test @ H_inv @ g_train).item()
     
-    def compute_influence_matrix(self, dataloader, H_inv, device):
+    def compute_influence_matrix(self, dataloader, H_inv, train_dataset_size, device):
         """
         Precomputes the N x N influence matrix C where C[j, i] is the 
         change in the LiRA statistic (scaled logit) for point j if 
@@ -194,17 +204,25 @@ class ResNet_Influence(nn.Module):
             y_onehot = F.one_hot(all_labels, num_classes=self.num_classes).float()
             
 
-            d_logits = probs - y_onehot            # [N, C]
-            
-            # Augment features with 1 for bias term
-            all_feats_aug = torch.cat([all_feats, torch.ones(N, 1, device=device)], dim=1)  # [N, 513]
-            
-            # Compute gradient: d_logits ⊗ all_feats_aug for each sample
-            # Result should be [N, C*513] with structure matching Kronecker product
-            G = torch.einsum('nc,nf->ncf', d_logits, all_feats_aug).reshape(N, -1)  # [N, C*513]
-        
-        C = -(G @ H_inv @ G.T) / N  # The 1/N comes from the influence function definition
-        
+            # Inside compute_influence_matrix
+            d_logits = probs - y_onehot  # Gradient of Cross-Entropy Loss
+
+            # Get true class probabilities for the LiRA gradient scalar
+            p_true = probs.gather(1, all_labels.unsqueeze(1))
+            p_true = torch.clamp(p_true, min=1e-7, max=1.0 - 1e-7)
+            # Gradient of LiRA statistic t = log(p/(1-p))
+            d_logits_lira = d_logits / (p_true - 1.0)
+
+            all_feats_aug = torch.cat([all_feats, torch.ones(N, 1, device=device)], dim=1)
+
+            # G_loss is the influence source (training points)
+            G_loss = torch.einsum('nc,nf->ncf', d_logits, all_feats_aug).reshape(N, -1)
+            # G_lira is the influence target (evaluating the shifted statistic)
+            G_lira = torch.einsum('nc,nf->ncf', d_logits_lira, all_feats_aug).reshape(N, -1)
+
+            # Matrix multiplication uses target (G_lira) and source (G_loss)
+        C = -(G_lira @ H_inv @ G_loss.T) / train_dataset_size
+
         return C
     
     

@@ -126,6 +126,8 @@ def main():
                        help='Identifier for this run (default: auto-generated from parameters)')
     parser.add_argument('--model-name', type=str, default='model',
                        help='Name of the model checkpoint')
+    parser.add_argument('--resume', action='store_true',
+                       help='Resume training from latest checkpoint if available')
     
     args = parser.parse_args()
     
@@ -191,6 +193,16 @@ def main():
         torch.save(model.state_dict(), model_path)
         print(f"  -> Saved best model (accuracy: {test_acc:.2f}%)")
     
+    # Determine if we should resume from latest checkpoint
+    resume_from = None
+    if args.resume:
+        latest_checkpoint = os.path.join(checkpoint_dir, 'checkpoint_latest.pth')
+        if os.path.exists(latest_checkpoint):
+            resume_from = latest_checkpoint
+            print(f"\\nResuming from checkpoint: {latest_checkpoint}\\n")
+        else:
+            print(f"\\nNo checkpoint found to resume from, starting fresh\\n")
+    
     # Train the model
     _, _, final_test_loss, final_test_acc = train_model(
         model=model,
@@ -199,7 +211,9 @@ def main():
         device=device,
         verbose=True,
         test_loader=test_loader,
-        save_best_callback=save_best_callback
+        save_best_callback=save_best_callback,
+        checkpoint_dir=checkpoint_dir,
+        resume_from=resume_from
     )
     
     # Save final model
