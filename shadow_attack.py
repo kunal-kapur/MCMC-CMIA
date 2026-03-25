@@ -1,7 +1,6 @@
 import os
 import json
 import gc
-import shutil
 import argparse
 from datetime import datetime
 
@@ -82,6 +81,60 @@ def train_single_shadow_model(subset_indices, device, training_config, checkpoin
     trained_model = train_shadow_model(model, subset_indices, training_config, device, checkpoint_path)
     return trained_model
 
+
+def _shadow_cache_metadata_path(shadow_models_dir):
+    return os.path.join(shadow_models_dir, 'cache_metadata.npz')
+
+
+def _normalized_confident_memberships(confident_memberships, num_queries):
+    if confident_memberships is None:
+        return np.full(num_queries, -1, dtype=np.int8)
+    return np.asarray(confident_memberships, dtype=np.int8)
+
+
+def _shadow_cache_matches(metadata_path, query_indices, confident_memberships, num_models, target_train_size):
+    if not os.path.exists(metadata_path):
+        return False, 'cache metadata is missing'
+
+    cache_metadata = np.load(metadata_path)
+    cached_query_indices = cache_metadata['query_indices']
+    cached_confident_memberships = cache_metadata['confident_memberships']
+    cached_num_models = int(cache_metadata['num_models'][0])
+    cached_target_train_size = int(cache_metadata['target_train_size'][0])
+
+    expected_query_indices = np.asarray(query_indices, dtype=np.int64)
+    expected_confident_memberships = _normalized_confident_memberships(
+        confident_memberships,
+        len(query_indices)
+    )
+
+    if cached_num_models != num_models:
+        return False, f'cached num_models={cached_num_models} does not match requested {num_models}'
+    if cached_target_train_size != target_train_size:
+        return False, (
+            f'cached target_train_size={cached_target_train_size} does not match '
+            f'requested {target_train_size}'
+        )
+    if not np.array_equal(cached_query_indices, expected_query_indices):
+        return False, 'cached query indices do not match the current attack run'
+    if not np.array_equal(cached_confident_memberships, expected_confident_memberships):
+        return False, 'cached anchors do not match the current block state'
+
+    return True, None
+
+
+def _write_shadow_cache_metadata(shadow_models_dir, query_indices, confident_memberships, num_models, target_train_size):
+    np.savez(
+        _shadow_cache_metadata_path(shadow_models_dir),
+        query_indices=np.asarray(query_indices, dtype=np.int64),
+        confident_memberships=_normalized_confident_memberships(
+            confident_memberships,
+            len(query_indices)
+        ),
+        num_models=np.array([num_models], dtype=np.int64),
+        target_train_size=np.array([target_train_size], dtype=np.int64),
+    )
+
 def train_shadow_models(query_indices, num_models, total_dataset_size, target_train_size, 
                        training_config, confident_memberships=None, shadow_models_dir=None):
     """
@@ -98,24 +151,57 @@ def train_shadow_models(query_indices, num_models, total_dataset_size, target_tr
         shadow_models_dir: Directory to save shadow models (enables checkpointing if provided)
     
     Returns:
-        Tuple of (shadow_models, shadow_datasets_m, shadow_subsets)
+        Tuple of (shadow_models, shadow_datasets_m, shadow_subsets, any_new_models_trained)
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     shadow_models = []
     shadow_datasets_m = [] 
     shadow_subsets = []
+    any_new_models_trained = False
     
     all_indices = set(range(total_dataset_size))
     background_pool = list(all_indices - set(query_indices))
     
     # Check if we're resuming from a previous run
     membership_matrix_path = None
+    cache_metadata_path = None
+    allow_cache_reuse = True
     if shadow_models_dir is not None:
         os.makedirs(shadow_models_dir, exist_ok=True)
         membership_matrix_path = os.path.join(shadow_models_dir, 'membership_matrix.npy')
+        cache_metadata_path = _shadow_cache_metadata_path(shadow_models_dir)
+
+        shadow_model_paths = [
+            os.path.join(shadow_models_dir, f"shadow_{k}.pth")
+            for k in range(num_models)
+        ]
+        has_existing_cache = os.path.exists(membership_matrix_path) or any(
+            os.path.exists(path) for path in shadow_model_paths
+        )
+        if has_existing_cache:
+            cache_matches, mismatch_reason = _shadow_cache_matches(
+                cache_metadata_path,
+                query_indices,
+                confident_memberships,
+                num_models,
+                target_train_size,
+            )
+            if not cache_matches:
+                print(
+                    f"  -> Ignoring existing shadow cache in {shadow_models_dir}: {mismatch_reason}."
+                )
+                allow_cache_reuse = False
+
+        _write_shadow_cache_metadata(
+            shadow_models_dir,
+            query_indices,
+            confident_memberships,
+            num_models,
+            target_train_size,
+        )
     
     # Load or create membership matrix
-    if membership_matrix_path and os.path.exists(membership_matrix_path):
+    if allow_cache_reuse and membership_matrix_path and os.path.exists(membership_matrix_path):
         print(f"  -> Loading existing membership matrix from {membership_matrix_path}")
         existing_matrix = np.load(membership_matrix_path)
         existing_num_models = existing_matrix.shape[0]
@@ -185,7 +271,7 @@ def train_shadow_models(query_indices, num_models, total_dataset_size, target_tr
     # Now train each shadow model based on the pre-computed membership matrix
     for k in range(num_models):
         # Check if this shadow model already exists
-        if shadow_models_dir is not None:
+        if shadow_models_dir is not None and allow_cache_reuse:
             shadow_model_path = os.path.join(shadow_models_dir, f"shadow_{k}.pth")
             if os.path.exists(shadow_model_path):
                 print(f"  -> Loading existing Shadow Model {k+1}/{num_models} from {shadow_model_path}")
@@ -201,6 +287,7 @@ def train_shadow_models(query_indices, num_models, total_dataset_size, target_tr
                 continue
         
         print(f"  -> Training Shadow Model {k+1}/{num_models}...")
+        any_new_models_trained = True
         
         m_k = membership_matrix[k]
         subset_indices = []
@@ -244,7 +331,7 @@ def train_shadow_models(query_indices, num_models, total_dataset_size, target_tr
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
-    return shadow_models, np.array(shadow_datasets_m), shadow_subsets
+    return shadow_models, np.array(shadow_datasets_m), shadow_subsets, any_new_models_trained
 
 
 def precompute_influence_matrices(shadow_models, shadow_subsets, query_indices, device, hessian_sample_size=3000):
@@ -296,7 +383,82 @@ def precompute_influence_matrices(shadow_models, shadow_subsets, query_indices, 
     print("done precomputing influence matrices.")
     return np.array(C_matrices), np.array(t_bases)
 
-def run_mcmc_block(target_scores, C_matrices, t_bases, m_actual, anchors, block_dir, num_steps=10000, prior_prob=0.5, temperature=0.7):
+def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, block_dir, target_fpr=0.01):
+    """
+    Standard LiRA (Likelihood Ratio Attack) baseline — no MCMC, no influence functions.
+
+    For each query point i:
+      - Collect shadow logit scores where point was IN vs OUT
+      - Fit Gaussian (mean, std) to each set
+      - Score = log p(target_score | IN Gaussian) - log p(target_score | OUT Gaussian)
+    A higher score means the model thinks the point is a member.
+
+    Args:
+        target_scores: Logit scores from the target model, shape (N,)
+        t_bases:       Shadow model logit scores, shape (K, N)
+        m_actual:      Membership matrix, shape (K, N), values 0 or 1
+        ground_truth:  Ground truth membership, shape (N,)
+        block_dir:     Directory to save results
+
+    Returns:
+        lira_scores: Per-point LiRA log-likelihood ratio scores, shape (N,)
+    """
+    N = len(target_scores)
+    K = len(t_bases)
+    global_std = np.std(t_bases, ddof=1) + 1e-8
+
+    lira_scores = np.zeros(N, dtype=np.float64)
+
+    for i in range(N):
+        in_scores  = t_bases[m_actual[:, i] == 1, i]
+        out_scores = t_bases[m_actual[:, i] == 0, i]
+
+        mu_in  = np.mean(in_scores)  if len(in_scores)  > 0 else 0.0
+        mu_out = np.mean(out_scores) if len(out_scores) > 0 else 0.0
+        std_in  = np.std(in_scores,  ddof=1) if len(in_scores)  > 1 else global_std
+        std_out = np.std(out_scores, ddof=1) if len(out_scores) > 1 else global_std
+        std_in  = std_in  if std_in  > 0 else global_std
+        std_out = std_out if std_out > 0 else global_std
+
+        log_p_in  = norm.logpdf(target_scores[i], loc=mu_in,  scale=std_in)
+        log_p_out = norm.logpdf(target_scores[i], loc=mu_out, scale=std_out)
+        lira_scores[i] = log_p_in - log_p_out
+
+    # Convert log-LR to a [0, 1] posterior-like probability via sigmoid for comparability
+    lira_probs = 1.0 / (1.0 + np.exp(-lira_scores))
+
+    # Save results
+    lira_results = {str(int(i)): float(lira_probs[i]) for i in range(N)}
+    with open(os.path.join(block_dir, "lira_baseline_probs.json"), "w") as f:
+        json.dump(lira_results, f, indent=2)
+    np.save(os.path.join(block_dir, "lira_baseline_scores.npy"), lira_scores)
+
+    # Metrics
+    fpr_curve, tpr_curve, _ = roc_curve(ground_truth, lira_probs)
+    valid = np.where(fpr_curve <= target_fpr)[0]
+    tpr_at_low_fpr = tpr_curve[valid[-1]] if len(valid) > 0 else float('nan')
+
+    lira_preds = np.where(lira_probs >= 0.5, 1, 0)
+    tp = int(np.sum((lira_preds == 1) & (ground_truth == 1)))
+    fp = int(np.sum((lira_preds == 1) & (ground_truth == 0)))
+    tn = int(np.sum((lira_preds == 0) & (ground_truth == 0)))
+    fn = int(np.sum((lira_preds == 0) & (ground_truth == 1)))
+    accuracy = (tp + tn) / N if N > 0 else 0.0
+    tpr_val = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    fpr_val = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+
+    print(f"\n{'='*80}")
+    print(f"LIRA BASELINE RESULTS (standard LiRA, no MCMC)")
+    print(f"{'='*80}")
+    print(f"Accuracy (threshold=0.5): {accuracy:.2%} ({tp+tn}/{N})")
+    print(f"TPR: {tpr_val:.2%}  FPR: {fpr_val:.2%}")
+    print(f"TPR at {target_fpr*100:.0f}% FPR: {tpr_at_low_fpr * 100:.2f}%")
+    print(f"{'='*80}\n")
+
+    return lira_scores
+
+
+def run_mcmc(target_scores, C_matrices, t_bases, m_actual, output_dir, num_steps=10000, prior_prob=0.5, temperature=0.7):
     N = len(target_scores)
     K = len(C_matrices)
     global_std = np.std(t_bases, ddof=1) + 1e-8
@@ -304,16 +466,8 @@ def run_mcmc_block(target_scores, C_matrices, t_bases, m_actual, anchors, block_
     # --- 1. PRECOMPUTE STATIC VARIABLES ONCE ---
     log_p = np.log(prior_prob + 1e-10)
     log_1_p = np.log(1 - prior_prob + 1e-10)
-    
-    valid_indices = np.where(anchors == -1)[0]
-    trace_file_path = os.path.join(block_dir, "mcmc_trace.npy")
-    
-    if len(valid_indices) == 0:
-        # If all anchors are known, write static array to disk and return path
-        static_trace = np.tile(anchors.astype(np.int8), (num_steps, 1))
-        with open(trace_file_path, "wb") as f:
-            f.write(static_trace.tobytes())
-        return trace_file_path
+    trace_file_path = os.path.join(output_dir, "mcmc_trace.npy")
+    valid_indices = np.arange(N)
         
     C_diag = np.diagonal(C_matrices, axis1=1, axis2=2)
     in_mask = (m_actual == 1)
@@ -322,10 +476,6 @@ def run_mcmc_block(target_scores, C_matrices, t_bases, m_actual, anchors, block_
     
     # --- 2. INITIALIZE STATE ---
     M_current = np.random.randint(0, 2, size=N, dtype=np.int8)
-    for i in range(N):
-        if anchors[i] != -1:
-            M_current[i] = anchors[i]
-            
     delta_current = M_current - m_actual
     
     # This expensive O(N^2) math happens EXACTLY ONCE
@@ -452,125 +602,42 @@ def aggregate_posterior(trace_path, num_points=2000, burn_in=200000):
     return posterior_probs, posterior_std
 
 
-def get_new_anchors(posterior_probs, posterior_std, current_anchors, 
-                    threshold_in=0.999, threshold_out=0.001, max_std=0.05):
-    """
-    Identify points we are highly confident about, filtering out unstable MCMC predictions.
-    
-    Args:
-        posterior_probs: Mean posterior probability for each point
-        posterior_std: Standard deviation of the MCMC samples for each point
-        current_anchors: Existing anchors array
-        threshold_in: Minimum probability to anchor as a member
-        threshold_out: Maximum probability to anchor as a non-member
-        max_std: Maximum allowed standard deviation to consider the prediction stable
-    """
-    new_anchors = current_anchors.copy()
-    
-    for i in range(len(posterior_probs)):
-        # Skip points that are already anchored
-        if current_anchors[i] != -1:
-            continue
-            
-        prob = posterior_probs[i]
-        std = posterior_std[i]
-        
-        # Only anchor if the MCMC chain was stable
-        if std <= max_std:
-            if prob >= threshold_in:
-                new_anchors[i] = 1
-            elif prob <= threshold_out:
-                new_anchors[i] = 0
-                
-    return new_anchors
+def save_attack_inputs(attack_dir, query_indices, ground_truth):
+    """Save the query set and labels needed for offline evaluation."""
+    np.savez(
+        os.path.join(attack_dir, 'attack_data.npz'),
+        query_indices=np.asarray(query_indices, dtype=np.int64),
+        ground_truth=np.asarray(ground_truth, dtype=np.int8),
+    )
+    print(f"Saved attack inputs to {attack_dir}")
 
-def save_attack_metadata(attack_dir, args, query_indices, ground_truth, anchors, target_model_path, meta_path):
-    """
-    Saves configuration and query setup for potential resume.
-    """
-    config = {
-        'num_queries': args.num_queries,
-        'num_shadow_models': args.num_shadow_models,
-        'num_blocks': args.num_blocks,
-        'checkpoint_dir': args.checkpoint_dir,
-        'use_final_model': args.use_final_model,
-        'member_percentage': args.member_percentage,
-        'mcmc_steps': args.mcmc_steps,
-        'burn_in': args.burn_in,
-        'confidence_threshold': args.confidence_threshold,
-        'temperature': args.temperature,
-        'target_model_path': target_model_path,
-        'meta_path': meta_path,
-        'timestamp': datetime.now().isoformat()
-    }
-    
-    with open(os.path.join(attack_dir, 'config.json'), 'w') as f:
-        json.dump(config, f, indent=2)
-    
-    np.save(os.path.join(attack_dir, 'query_indices.npy'), query_indices)
-    np.save(os.path.join(attack_dir, 'ground_truth.npy'), ground_truth)
-    np.save(os.path.join(attack_dir, 'initial_anchors.npy'), anchors)
-    
-    print(f"Saved attack metadata to {attack_dir}")
 
-def load_checkpoint_state(resume_dir):
-    """
-    Loads state from a previous attack run to resume from.
-    Returns: (config, query_indices, ground_truth, anchors, last_completed_block)
-    """
-    print(f"Loading checkpoint from {resume_dir}...")
-    
-    # Load config
-    with open(os.path.join(resume_dir, 'config.json'), 'r') as f:
-        config = json.load(f)
-    
-    # Load query setup
-    query_indices = np.load(os.path.join(resume_dir, 'query_indices.npy'))
-    ground_truth = np.load(os.path.join(resume_dir, 'ground_truth.npy'))
-    
-    # Find the last completed block by checking which block directories exist
-    last_completed_block = -1
-    for block_num in range(config['num_blocks']):
-        block_name = f"block_{block_num}_random_init" if block_num == 0 else f"block_{block_num}_cascade"
-        block_dir = os.path.join(resume_dir, block_name)
-        
-        # Check if block was fully completed (has anchors_for_next_block.npy)
-        if os.path.exists(os.path.join(block_dir, 'anchors_for_next_block.npy')):
-            last_completed_block = block_num
-        else:
-            break
-    
-    # Load anchors from the last completed block, or initial if none completed
-    if last_completed_block >= 0:
-        last_block_name = f"block_{last_completed_block}_random_init" if last_completed_block == 0 else f"block_{last_completed_block}_cascade"
-        last_block_dir = os.path.join(resume_dir, last_block_name)
-        anchors = np.load(os.path.join(last_block_dir, 'anchors_for_next_block.npy'))
-        print(f"Resuming from block {last_completed_block + 1} (last completed: block {last_completed_block})")
-    else:
-        anchors = np.load(os.path.join(resume_dir, 'initial_anchors.npy'))
-        print(f"No completed blocks found, starting from block 0")
-    
-    return config, query_indices, ground_truth, anchors, last_completed_block + 1
+def load_attack_inputs(attack_dir):
+    """Load query indices and ground-truth labels from a previous run."""
+    attack_data_path = os.path.join(attack_dir, 'attack_data.npz')
+    if not os.path.exists(attack_data_path):
+        raise FileNotFoundError(
+            f"Missing attack data file: {attack_data_path}. "
+            "Cannot reuse this run for MCMC-only execution."
+        )
+
+    attack_data = np.load(attack_data_path)
+    query_indices = attack_data['query_indices']
+    ground_truth = attack_data['ground_truth']
+    return query_indices, ground_truth
 
 def setup_attack_directory(base_dir="attacks"):
     """Creates a unique timestamped directory for this attack run."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # TODO ADJUST, KEEPING SO I DONT RETRAIN MODEL
-    timestamp = "20260227_111315" # TEMPORARY OVERRIDE FOR TESTING
     attack_dir = os.path.join(base_dir, f"run_{timestamp}")
-    os.makedirs(attack_dir, exist_ok=True)
-    return attack_dir
 
-def setup_block_directory(attack_dir, block_num):
-    """Creates subfolders for a specific MCMC block."""
-    block_name = f"block_{block_num}_random_init" if block_num == 0 else f"block_{block_num}_cascade"
-    block_dir = os.path.join(attack_dir, block_name)
-    
-    os.makedirs(block_dir, exist_ok=True)
-    os.makedirs(os.path.join(block_dir, "shadow_models"), exist_ok=True)
-    os.makedirs(os.path.join(block_dir, "precomputed_matrices"), exist_ok=True)
-    
-    return block_dir
+    suffix = 1
+    while os.path.exists(attack_dir):
+        attack_dir = os.path.join(base_dir, f"run_{timestamp}_{suffix:02d}")
+        suffix += 1
+
+    os.makedirs(attack_dir, exist_ok=False)
+    return attack_dir
 
 def load_target_metadata(meta_path):
     """Loads the exact indices the target model was trained on."""
@@ -586,7 +653,6 @@ def setup_query_points(meta_path, num_queries=1000, total_dataset_size=50000, me
     Returns:
         query_indices: The absolute indices in the CIFAR-10 dataset to attack.
         ground_truth: Array of 1s (Member) and 0s (Non-Member) for evaluation.
-        anchors: Array initialized to -1 (uncertain) to track MCMC confidence.
     """
     # Figure out what the target model actually saw
     true_members = load_target_metadata(meta_path)
@@ -604,38 +670,7 @@ def setup_query_points(meta_path, num_queries=1000, total_dataset_size=50000, me
     np.random.shuffle(query_indices)
     
     ground_truth = np.array([1 if idx in true_members else 0 for idx in query_indices])
-    
-    anchors = np.full(num_queries, -1) # 1 for member, 0 for non-member, -1 for uncertain (used in cascade)
-    
-    return query_indices, ground_truth, anchors
-
-def load_existing_shadow_models(shadow_models_dir, num_models):
-    shadow_models = []
-    shadow_subsets = []
-    
-    # Load the global m_actual matrix
-    m_actual_path = os.path.join(shadow_models_dir, "m_actual.npy")
-    m_actual = np.load(m_actual_path)
-    
-    for k in range(num_models):
-        model_path = os.path.join(shadow_models_dir, f"shadow_{k}.pth")
-        checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
-        
-        # Initialize a new model architecture
-        model = ResNet18_Influence()
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.eval()
-        
-        shadow_models.append(model)
-        
-        # Extract the saved training subset indices
-        # Fallback to an empty list or error if trying to load an old checkpoint
-        if 'subset_indices' in checkpoint:
-            shadow_subsets.append(checkpoint['subset_indices'])
-        else:
-            raise KeyError(f"Checkpoint {model_path} does not contain 'subset_indices'. You must retrain the models.")
-            
-    return shadow_models, m_actual, shadow_subsets
+    return query_indices, ground_truth
 
 
 
@@ -645,9 +680,7 @@ def main():
     parser.add_argument('--num_queries', type=int, default=1000,
                         help='Number of query points to attack (default: 1000)')
     parser.add_argument('--num_shadow_models', type=int, default=16,
-                        help='Number of shadow models to train per block (default: 16)')
-    parser.add_argument('--num_blocks', type=int, default=3,
-                        help='Number of MCMC blocks to run (default: 3)')
+                        help='Number of shadow models to train (default: 16)')
     parser.add_argument('--checkpoint-dir', type=str, required=True,
                         help='Directory containing the target model checkpoint and metadata')
     parser.add_argument('--prior-prob', type=float, required=True, help='Adversary\'s prior probability that any given point is a member, useful for preventing FP')
@@ -656,114 +689,80 @@ def main():
     parser.add_argument('--member-percentage', type=float, default=0.5,
                         help='Percentage of query points that are true members (default: 0.5 for 50%%)')
     parser.add_argument('--mcmc-steps', type=int, default=10000,
-                        help='Number of MCMC steps per block (default: 10000)')
+                        help='Number of MCMC steps (default: 10000)')
     parser.add_argument('--burn-in', type=int, default=2000,
                         help='Number of burn-in samples to discard when aggregating posterior (default: 2000)')
-    parser.add_argument('--confidence-threshold', type=float, default=0.999,
-                        help='Confidence threshold for anchoring points (default: 0.999 for 99.9%%)')
     parser.add_argument('--shadow-epochs', type=int, default=None,
                         help='Number of epochs to train shadow models (default: use target model epochs from metadata)')
-    parser.add_argument('--resume-from', type=str, default=None,
-                        help='Resume attack from a previous run directory (overrides other arguments)')
     parser.add_argument('--temperature', type=float, default=0.7,
                         help='Temperature scaling for likelihood computation (default: 0.7)')
+    parser.add_argument('--attack-dir', type=str, default="attacks",
+                        help='Base directory to store attack results (default: attacks)')
+    parser.add_argument('--reuse-attack-run', type=str, default=None,
+                        help='Reuse an existing attack run directory and skip shadow retraining/influence precompute')
+
     
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Check if resuming from checkpoint
-    if args.resume_from:
-        print("=" * 60)
-        print("RESUMING FROM CHECKPOINT")
-        print("=" * 60)
-        
-        if not os.path.exists(args.resume_from):
-            raise FileNotFoundError(f"Resume directory not found: {args.resume_from}")
-        
-        # Load checkpoint state
-        config, query_indices, ground_truth, anchors, start_block = load_checkpoint_state(args.resume_from)
-        
-        # Use the same attack directory (resume in place)
-        attack_dir = args.resume_from
-        
-        # Extract configuration from loaded config
-        checkpoint_dir = config['checkpoint_dir']
-        target_model_path = config['target_model_path']
-        meta_path = config['meta_path']
-        NUM_QUERIES = config['num_queries']
-        NUM_SHADOW_MODELS = config['num_shadow_models']
-        NUM_BLOCKS = config['num_blocks']
-        MCMC_STEPS = config['mcmc_steps']
-        BURN_IN = config['burn_in']
-        CONFIDENCE_THRESHOLD = config.get('confidence_threshold', 0.999)
-        PRIOR_PROB = config['prior_prob']
-        TEMPERATURE = config.get('temperature', 0.7)
-        
-        print(f"Loaded configuration from checkpoint:")
-        print(f"  - Attack Directory: {attack_dir}")
-        print(f"  - Num Queries: {NUM_QUERIES}")
-        print(f"  - Num Shadow Models: {NUM_SHADOW_MODELS}")
-        print(f"  - Num Blocks: {NUM_BLOCKS}")
-        print(f"  - MCMC Steps: {MCMC_STEPS}")
-        print(f"  - Burn-in: {BURN_IN}")
-        print(f"  - Confidence Threshold: {CONFIDENCE_THRESHOLD}")
-        print(f"  - Temperature: {TEMPERATURE}")
-        print(f"  - Starting from Block: {start_block}")
-        print(f"  - Anchored Points: {np.sum(anchors != -1)} / {len(anchors)}")
-        print(f"  - Prior Membership Probability: {PRIOR_PROB:.4f}")
-        
+
+    reuse_mode = args.reuse_attack_run is not None
+    if reuse_mode:
+        attack_dir = args.reuse_attack_run
+        if not os.path.exists(attack_dir):
+            raise FileNotFoundError(f"Reuse run directory not found: {attack_dir}")
     else:
-        # Fresh start - normal initialization
-        attack_dir = setup_attack_directory()
-        
-        # Auto-discover metadata and model files from checkpoint directory
-        checkpoint_dir = args.checkpoint_dir
-        meta_path = os.path.join(checkpoint_dir, "training_metadata.json")
-        
-        if not os.path.exists(meta_path):
-            raise FileNotFoundError(f"Metadata file not found: {meta_path}")
-        
-        # Determine which model to use
-        model_suffix = "final" if args.use_final_model else "best"
-        
-        # Find model file in checkpoint directory
-        model_files = [f for f in os.listdir(checkpoint_dir) if f.endswith(f"_{model_suffix}.pth")]
-        if not model_files:
-            raise FileNotFoundError(f"No model file found with suffix '{model_suffix}' in {checkpoint_dir}")
-        
-        target_model_path = os.path.join(checkpoint_dir, model_files[0])
-        
-        print(f"Loading target model from: {target_model_path}")
-        print(f"Loading metadata from: {meta_path}")
-        
+        attack_dir = setup_attack_directory(base_dir=args.attack_dir)
+
+    checkpoint_dir = args.checkpoint_dir
+    meta_path = os.path.join(checkpoint_dir, "training_metadata.json")
+
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(f"Metadata file not found: {meta_path}")
+
+    model_suffix = "final" if args.use_final_model else "best"
+    model_files = [f for f in os.listdir(checkpoint_dir) if f.endswith(f"_{model_suffix}.pth")]
+    if not model_files:
+        raise FileNotFoundError(f"No model file found with suffix '{model_suffix}' in {checkpoint_dir}")
+
+    target_model_path = os.path.join(checkpoint_dir, model_files[0])
+
+    print(f"Loading target model from: {target_model_path}")
+    print(f"Loading metadata from: {meta_path}")
+
+    NUM_SHADOW_MODELS = args.num_shadow_models
+    MCMC_STEPS = args.mcmc_steps
+    BURN_IN = args.burn_in
+    PRIOR_PROB = args.prior_prob
+    TEMPERATURE = args.temperature
+
+    if reuse_mode:
+        query_indices, ground_truth = load_attack_inputs(attack_dir)
+        NUM_QUERIES = len(query_indices)
+    else:
         NUM_QUERIES = args.num_queries
-        NUM_SHADOW_MODELS = args.num_shadow_models
-        NUM_BLOCKS = args.num_blocks
-        MCMC_STEPS = args.mcmc_steps
-        BURN_IN = args.burn_in
-        CONFIDENCE_THRESHOLD = args.confidence_threshold
-        PRIOR_PROB = args.prior_prob
-        TEMPERATURE = args.temperature
-        print(f"Attack configuration:")
-        print(f"  - Checkpoint Directory: {checkpoint_dir}")
-        print(f"  - Target Model: {target_model_path}")
-        print(f"  - Num Queries: {NUM_QUERIES}")
-        print(f"  - Num Shadow Models: {NUM_SHADOW_MODELS}")
-        print(f"  - Prior Membership Probability: {PRIOR_PROB:.4f}")
-        print(f"  - Num Blocks: {NUM_BLOCKS}")
-        print(f"  - Confidence Threshold: {CONFIDENCE_THRESHOLD}")
-        print(f"  - MCMC Steps: {MCMC_STEPS}")
-        print(f"  - Burn-in: {BURN_IN}")
-        print(f"  - Temperature: {TEMPERATURE}")
+        query_indices, ground_truth = setup_query_points(
+            meta_path,
+            num_queries=NUM_QUERIES,
+            member_percentage=args.member_percentage,
+        )
+
+    print(f"Attack configuration:")
+    print(f"  - Checkpoint Directory: {checkpoint_dir}")
+    print(f"  - Target Model: {target_model_path}")
+    print(f"  - Attack Directory: {attack_dir}")
+    print(f"  - Reuse Existing Run: {'yes' if reuse_mode else 'no'}")
+    print(f"  - Num Queries: {NUM_QUERIES}")
+    print(f"  - Num Shadow Models: {NUM_SHADOW_MODELS}")
+    print(f"  - Prior Membership Probability: {PRIOR_PROB:.4f}")
+    print(f"  - MCMC Steps: {MCMC_STEPS}")
+    print(f"  - Burn-in: {BURN_IN}")
+    print(f"  - Temperature: {TEMPERATURE}")
+    if not reuse_mode:
         print(f"  - Member Percentage: {args.member_percentage * 100:.1f}%")
-        
-        query_indices, ground_truth, anchors = setup_query_points(meta_path, num_queries=NUM_QUERIES, member_percentage=args.member_percentage)
-        
-        # Save metadata for potential resume
-        save_attack_metadata(attack_dir, args, query_indices, ground_truth, anchors, target_model_path, meta_path)
-        
-        start_block = 0
+
+    if not reuse_mode:
+        save_attack_inputs(attack_dir, query_indices, ground_truth)
     
     # Load target metadata for dataset sizes and training configuration
     with open(meta_path, 'r') as f:
@@ -772,182 +771,184 @@ def main():
     TOTAL_DATASET_SIZE = meta['total_cifar10_train_size']
     TARGET_TRAIN_SIZE = meta['num_samples_used']
     
-    # Load training configuration from metadata
-    print(f"\nLoading training configuration from metadata...")
-    training_config = TrainingConfig.from_metadata(meta_path)
-    
-    # Override epochs if specified
-    if args.shadow_epochs is not None:
-        print(f"  Overriding epochs: {training_config.epochs} -> {args.shadow_epochs}")
-        training_config.epochs = args.shadow_epochs
-    
-    print(f"  Shadow models will use:")
-    print(f"    - Optimizer: {training_config.optimizer_type.upper()}")
-    print(f"    - Learning rate: {training_config.lr}")
-    print(f"    - Epochs: {training_config.epochs}")
-    print(f"    - Batch size: {training_config.batch_size}")
-    print(f"    - Scheduler: {training_config.scheduler_type}")
+    training_config = None
+    if not reuse_mode:
+        # Load training configuration from metadata
+        print(f"\nLoading training configuration from metadata...")
+        training_config = TrainingConfig.from_metadata(meta_path)
+
+        # Override epochs if specified
+        if args.shadow_epochs is not None:
+            print(f"  Overriding epochs: {training_config.epochs} -> {args.shadow_epochs}")
+            training_config.epochs = args.shadow_epochs
+
+        print(f"  Shadow models will use:")
+        print(f"    - Optimizer: {training_config.optimizer_type.upper()}")
+        print(f"    - Learning rate: {training_config.lr}")
+        print(f"    - Epochs: {training_config.epochs}")
+        print(f"    - Batch size: {training_config.batch_size}")
+        print(f"    - Scheduler: {training_config.scheduler_type}")
     
     print(f"\nTarget model was trained on {TARGET_TRAIN_SIZE} samples out of {TOTAL_DATASET_SIZE}.")
     print(f"Starting attack on {len(query_indices)} points.")
     print(f"Number of true members in query set: {np.sum(ground_truth)}")
-    
-    for block in range(start_block, NUM_BLOCKS):
-        print(f"\n{'='*40}")
-        print(f"--- Starting Block {block} ---")
-        print(f"Current Anchors: {np.sum(anchors != -1)} / {len(anchors)}")
-        print(f"{'='*40}")
-        
-        block_dir = setup_block_directory(attack_dir, block)
-        
-        # Shadow models directory for this block
-        shadow_models_dir = os.path.join(block_dir, "shadow_models")
-        os.makedirs(shadow_models_dir, exist_ok=True)
-        
-        # Train shadow models (with automatic resumption if models already exist)
-        shadow_models, m_actual, shadow_subsets = train_shadow_models(
+
+    shadow_models_dir = os.path.join(attack_dir, "shadow_models")
+    precomputed_dir = os.path.join(attack_dir, "precomputed_matrices")
+    os.makedirs(shadow_models_dir, exist_ok=True)
+    os.makedirs(precomputed_dir, exist_ok=True)
+
+    influence_cache_path = os.path.join(precomputed_dir, "influence_data.npz")
+    m_actual_path = os.path.join(shadow_models_dir, "m_actual.npy")
+
+    if reuse_mode:
+        if not os.path.exists(influence_cache_path):
+            raise FileNotFoundError(
+                f"Missing influence cache at {influence_cache_path}. "
+                "Run without --reuse-attack-run once to build shadow models/influence matrices first."
+            )
+        if not os.path.exists(m_actual_path):
+            raise FileNotFoundError(
+                f"Missing membership matrix at {m_actual_path}. "
+                "Run without --reuse-attack-run once to build shadow models first."
+            )
+
+        print(f"Reusing cached shadow artifacts from {attack_dir}...")
+        influence_data = np.load(influence_cache_path)
+        C_matrices = influence_data['C_matrices']
+        t_bases = influence_data['t_bases']
+        m_actual = np.load(m_actual_path)
+
+        if m_actual.shape[1] != len(query_indices):
+            raise ValueError(
+                f"Mismatch between cached memberships ({m_actual.shape[1]} points) and "
+                f"attack_data.npz ({len(query_indices)} points)."
+            )
+    else:
+        shadow_models, m_actual, shadow_subsets, any_new_models_trained = train_shadow_models(
             query_indices=query_indices,
             num_models=NUM_SHADOW_MODELS,
             total_dataset_size=TOTAL_DATASET_SIZE,
             target_train_size=TARGET_TRAIN_SIZE,
             training_config=training_config,
-            confident_memberships=anchors,
+            confident_memberships=None,
             shadow_models_dir=shadow_models_dir
         )
-        
-        # Save m_actual matrix globally
-        np.save(os.path.join(shadow_models_dir, "m_actual.npy"), m_actual)
-        
-        # Save models AND their exact training subsets
+
+        np.save(m_actual_path, m_actual)
+
         for k, model in enumerate(shadow_models):
             torch.save({
                 'model_state_dict': model.state_dict(),
                 'm_k': m_actual[k],
                 'subset_indices': shadow_subsets[k]
-            }, os.path.join(block_dir, "shadow_models", f"shadow_{k}.pth"))
+            }, os.path.join(shadow_models_dir, f"shadow_{k}.pth"))
 
-        print("Done training shadow models. Now precomputing influence matrices...")
-        C_matrices, t_bases = precompute_influence_matrices(
-            shadow_models=shadow_models, 
-            shadow_subsets=shadow_subsets,
-            query_indices=query_indices, 
-            device=device,
-            hessian_sample_size=5000
-        )
-        
-        np.savez_compressed(
-            os.path.join(block_dir, "precomputed_matrices", "influence_data.npz"), 
-            C_matrices=C_matrices, 
-            t_bases=t_bases
-        )
-
-        print("Evaluating target model on query points...")
-        
-        target_scores = evaluate_target_model(target_model_path, query_indices, device)
-        
-        print(f"Running MCMC for {NUM_QUERIES} points...")
-
-        # Assume adversary has good prior on query
-        trace_path = run_mcmc_block(
-            target_scores=target_scores,
-            C_matrices=C_matrices, 
-            t_bases=t_bases, 
-            m_actual=m_actual, 
-            anchors=anchors, 
-            block_dir=block_dir,
-            num_steps=MCMC_STEPS,
-            prior_prob=PRIOR_PROB,  # Use the prior probability passed in via args
-            temperature=TEMPERATURE
-        )
-
-        # Aggregate step
-        posterior_probs, posterior_std = aggregate_posterior(
-            trace_path, 
-            num_points=len(target_scores), 
-            burn_in=200000
-        )
-
-        posterior_dict = {str(q_idx): float(prob) for q_idx, prob in zip(query_indices, posterior_probs)}
-        with open(os.path.join(block_dir, "posterior_probs.json"), "w") as f:
-            json.dump(posterior_dict, f, indent=2)
-        
-        # Print confidence table
-        print(f"\n{'='*80}")
-        print(f"BLOCK {block} RESULTS: Membership Predictions vs Ground Truth")
-        print(f"{'='*80}")
-        
-        # Determine predictions based on posterior probabilities
-        predictions = []
-        for prob in posterior_probs:
-            if prob >= 0.99:
-                predictions.append('1')  # Confident: IN
-            elif prob <= 0.01:
-                predictions.append('0')  # Confident: OUT
-            else:
-                predictions.append('?')  # Uncertain
-        
-        # Print table header (first 20 points)
-        num_to_show = min(100, len(query_indices))
-        header = "Point:      " + "  ".join([f"{i+1:>3}" for i in range(num_to_show)])
-        print(header)
-        print("-" * len(header))
-        pred_row = "Predicted:  " + "  ".join([f"{p:>3}" for p in predictions[:num_to_show]])
-        print(pred_row)
-        
-        truth_row = "Actual:     " + "  ".join([f"{int(gt):>3}" for gt in ground_truth[:num_to_show]])
-        print(truth_row)
-
-        posterior_row = "Posterior:  " + "  ".join([f"{prob:.2f}" for prob in posterior_probs[:num_to_show]])
-        print(posterior_row)
-        
-        # confusion matrix
-        tp = sum(1 for p, gt in zip(predictions, ground_truth) if p == '1' and gt == 1)
-        fp = sum(1 for p, gt in zip(predictions, ground_truth) if p == '1' and gt == 0)
-        tn = sum(1 for p, gt in zip(predictions, ground_truth) if p == '0' and gt == 0)
-        fn = sum(1 for p, gt in zip(predictions, ground_truth) if p == '0' and gt == 1)
-        
-        correct = tp + tn
-        confident_predictions = sum(1 for p in predictions if p != '?')
-        accuracy = correct / confident_predictions if confident_predictions > 0 else 0
-        
-        # Calculate TPR and FPR
-        actual_positives = tp + fn
-        actual_negatives = fp + tn
-        tpr = tp / actual_positives if actual_positives > 0 else 0
-        fpr = fp / actual_negatives if actual_negatives > 0 else 0
-        
-        print(f"\nConfident predictions: {confident_predictions}/{len(query_indices)}")
-        print(f"Accuracy on confident predictions: {accuracy:.2%} ({correct}/{confident_predictions})")
-        print(f"True Positive Rate (TPR): {tpr:.2%} ({tp}/{actual_positives})")
-        print(f"False Positive Rate (FPR): {fpr:.2%} ({fp}/{actual_negatives})")
-        print(f"{'='*80}\n")
-
-        fpr, tpr, thresholds = roc_curve(ground_truth, posterior_probs)
-
-        # Find the TPR where FPR is strictly <= 0.001 (0.1%)
-        target_fpr = 0.001
-        valid_indices = np.where(fpr <= target_fpr)[0]
-
-        if len(valid_indices) > 0:
-            tpr_at_low_fpr = tpr[valid_indices[-1]]
-            print(f"Success! TPR at 0.1% FPR: {tpr_at_low_fpr * 100:.2f}%")
+        if (not any_new_models_trained) and os.path.exists(influence_cache_path):
+            print(f"Done loading shadow models. Reusing cached influence data from {influence_cache_path}...")
+            influence_data = np.load(influence_cache_path)
+            C_matrices = influence_data['C_matrices']
+            t_bases = influence_data['t_bases']
         else:
-            print("Could not measure 0.1% FPR. Need more non-member points or shadow models.")
-                    
-        # Cascade (new anchors for next block)
-        anchors = get_new_anchors(
-            posterior_probs=posterior_probs, 
-            posterior_std=posterior_std, 
-            current_anchors=anchors, 
-            threshold_in=CONFIDENCE_THRESHOLD, 
-            threshold_out=(1 - CONFIDENCE_THRESHOLD),
-            max_std=0.05  # Strict variance limit for anchoring
-        )
-        np.save(os.path.join(block_dir, 'anchors_for_next_block.npy'), anchors)
-        #TODO REMOVE TO CHECK FIRST ITERATION
-        exit(0)
-        
-        np.save(os.path.join(block_dir, "anchors_for_next_block.npy"), anchors)
+            print("Done training/loading shadow models. Now precomputing influence matrices...")
+            C_matrices, t_bases = precompute_influence_matrices(
+                shadow_models=shadow_models,
+                shadow_subsets=shadow_subsets,
+                query_indices=query_indices,
+                device=device,
+                hessian_sample_size=5000
+            )
+
+            np.savez_compressed(
+                influence_cache_path,
+                C_matrices=C_matrices,
+                t_bases=t_bases
+            )
+
+    print("Evaluating target model on query points...")
+    target_scores = evaluate_target_model(target_model_path, query_indices, device)
+
+    TARGET_FPR = 0.01
+    run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, attack_dir, target_fpr=TARGET_FPR)
+
+    print(f"Running MCMC for {NUM_QUERIES} points...")
+    trace_path = run_mcmc(
+        target_scores=target_scores,
+        C_matrices=C_matrices,
+        t_bases=t_bases,
+        m_actual=m_actual,
+        output_dir=attack_dir,
+        num_steps=MCMC_STEPS,
+        prior_prob=PRIOR_PROB,
+        temperature=TEMPERATURE
+    )
+
+    posterior_probs, posterior_std = aggregate_posterior(
+        trace_path,
+        num_points=len(target_scores),
+        burn_in=BURN_IN
+    )
+
+    posterior_dict = {str(q_idx): float(prob) for q_idx, prob in zip(query_indices, posterior_probs)}
+    with open(os.path.join(attack_dir, "posterior_probs.json"), "w") as f:
+        json.dump(posterior_dict, f, indent=2)
+
+    np.save(os.path.join(attack_dir, "posterior_std.npy"), posterior_std)
+
+    print(f"\n{'='*80}")
+    print("ATTACK RESULTS: Membership Predictions vs Ground Truth")
+    print(f"{'='*80}")
+
+    predictions = []
+    for prob in posterior_probs:
+        if prob >= 0.99:
+            predictions.append('1')
+        elif prob <= 0.01:
+            predictions.append('0')
+        else:
+            predictions.append('?')
+
+    num_to_show = min(100, len(query_indices))
+    header = "Point:      " + "  ".join([f"{i+1:>3}" for i in range(num_to_show)])
+    print(header)
+    print("-" * len(header))
+    pred_row = "Predicted:  " + "  ".join([f"{p:>3}" for p in predictions[:num_to_show]])
+    print(pred_row)
+
+    truth_row = "Actual:     " + "  ".join([f"{int(gt):>3}" for gt in ground_truth[:num_to_show]])
+    print(truth_row)
+
+    posterior_row = "Posterior:  " + "  ".join([f"{prob:.2f}" for prob in posterior_probs[:num_to_show]])
+    print(posterior_row)
+
+    tp = sum(1 for p, gt in zip(predictions, ground_truth) if p == '1' and gt == 1)
+    fp = sum(1 for p, gt in zip(predictions, ground_truth) if p == '1' and gt == 0)
+    tn = sum(1 for p, gt in zip(predictions, ground_truth) if p == '0' and gt == 0)
+    fn = sum(1 for p, gt in zip(predictions, ground_truth) if p == '0' and gt == 1)
+
+    correct = tp + tn
+    confident_predictions = sum(1 for p in predictions if p != '?')
+    accuracy = correct / confident_predictions if confident_predictions > 0 else 0
+
+    actual_positives = tp + fn
+    actual_negatives = fp + tn
+    tpr = tp / actual_positives if actual_positives > 0 else 0
+    fpr = fp / actual_negatives if actual_negatives > 0 else 0
+
+    print(f"\nConfident predictions: {confident_predictions}/{len(query_indices)}")
+    print(f"Accuracy on confident predictions: {accuracy:.2%} ({correct}/{confident_predictions})")
+    print(f"True Positive Rate (TPR): {tpr:.2%} ({tp}/{actual_positives})")
+    print(f"False Positive Rate (FPR): {fpr:.2%} ({fp}/{actual_negatives})")
+    print(f"{'='*80}\n")
+
+    fpr_curve, tpr_curve, _ = roc_curve(ground_truth, posterior_probs)
+    valid_indices = np.where(fpr_curve <= TARGET_FPR)[0]
+
+    if len(valid_indices) > 0:
+        tpr_at_low_fpr = tpr_curve[valid_indices[-1]]
+        print(f"Success! TPR at {TARGET_FPR*100:.0f}% FPR: {tpr_at_low_fpr * 100:.2f}%")
+    else:
+        print(f"Could not measure {TARGET_FPR*100:.0f}% FPR. Need more non-member points or shadow models.")
 
 if __name__ == "__main__":
     main()

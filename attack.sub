@@ -10,24 +10,29 @@ echo $(hostname)
 echo "CUDA_VISIBLE_DEVICES is set to: $CUDA_VISIBLE_DEVICES"
 
 mkdir -p logs
-mkdir -p attacks
+mkdir -p /scratch/scholar/kapur16/attacks
 
 # Run shadow model membership inference attack
 srun python -u shadow_attack.py \
-    --checkpoint-dir ./checkpoints/25pct_seed42 \
+    --checkpoint-dir ./checkpoints/10pct_seed42_overfit \
     --num_queries 2000 \
     --num_shadow_models 32 \
-    --num_blocks 3 \
     --member-percentage 0.5 \
-    --mcmc-steps 300000 \
+    --mcmc-steps 250000 \
     --burn-in 20000 \
     --shadow-epochs 50 \
-    --confidence-threshold 0.95 \
     --prior-prob 0.5 \
     --temperature 0.7 \
-    --use-final-model
+    --use-final-model \
+    --attack-dir /scratch/scholar/kapur16/attacks
 
-
-# To resume from a previous attack
-# srun python shadow_attack.py \
-#     --resume-from ./attacks/run_YYYYMMDD_HHMMSS
+# MCMC-only rerun from an existing attack timestamp (no shadow retraining):
+# srun python -u shadow_attack.py \
+#     --checkpoint-dir ./checkpoints/10pct_seed42_overfit \
+#     --num_shadow_models 32 \
+#     --mcmc-steps 250000 \
+#     --burn-in 20000 \
+#     --prior-prob 0.5 \
+#     --temperature 0.7 \
+#     --use-final-model \
+#     --reuse-attack-run /scratch/scholar/kapur16/attacks/run_YYYYMMDD_HHMMSS
