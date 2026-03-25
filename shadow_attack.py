@@ -118,7 +118,7 @@ def _shadow_cache_matches(metadata_path, query_indices, confident_memberships, n
     if not np.array_equal(cached_query_indices, expected_query_indices):
         return False, 'cached query indices do not match the current attack run'
     if not np.array_equal(cached_confident_memberships, expected_confident_memberships):
-        return False, 'cached anchors do not match the current block state'
+        return False, 'cached anchors do not match the current run'
 
     return True, None
 
@@ -383,7 +383,7 @@ def precompute_influence_matrices(shadow_models, shadow_subsets, query_indices, 
     print("done precomputing influence matrices.")
     return np.array(C_matrices), np.array(t_bases)
 
-def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, block_dir, target_fpr=0.01):
+def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, attack_dir, target_fpr=0.01):
     """
     Standard LiRA (Likelihood Ratio Attack) baseline — no MCMC, no influence functions.
 
@@ -398,7 +398,7 @@ def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, block_dir,
         t_bases:       Shadow model logit scores, shape (K, N)
         m_actual:      Membership matrix, shape (K, N), values 0 or 1
         ground_truth:  Ground truth membership, shape (N,)
-        block_dir:     Directory to save results
+        attack_dir:    Directory to save results
 
     Returns:
         lira_scores: Per-point LiRA log-likelihood ratio scores, shape (N,)
@@ -429,9 +429,9 @@ def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, block_dir,
 
     # Save results
     lira_results = {str(int(i)): float(lira_probs[i]) for i in range(N)}
-    with open(os.path.join(block_dir, "lira_baseline_probs.json"), "w") as f:
+    with open(os.path.join(attack_dir, "lira_baseline_probs.json"), "w") as f:
         json.dump(lira_results, f, indent=2)
-    np.save(os.path.join(block_dir, "lira_baseline_scores.npy"), lira_scores)
+    np.save(os.path.join(attack_dir, "lira_baseline_scores.npy"), lira_scores)
 
     # Metrics
     fpr_curve, tpr_curve, _ = roc_curve(ground_truth, lira_probs)
