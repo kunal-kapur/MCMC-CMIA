@@ -266,21 +266,6 @@ def ResNet18_Influence():
     return ResNet_Influence(BasicBlock, [2, 2, 2, 2])
 
 
-# def ResNet34():
-#     return ResNet(BasicBlock, [3, 4, 6, 3])
-
-
-# def ResNet50():
-#     return ResNet(Bottleneck, [3, 4, 6, 3])
-
-
-# def ResNet101():
-#     return ResNet(Bottleneck, [3, 4, 23, 3])
-
-
-# def ResNet152():
-#     return ResNet(Bottleneck, [3, 8, 36, 3])
-
 
 def test():
     net = ResNet18_Influence()

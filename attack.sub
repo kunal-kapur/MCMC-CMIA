@@ -2,7 +2,7 @@
 #SBATCH -A gpu
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH -t 04:00:00
+#SBATCH -t 12:00:00
 #SBATCH -o logs/%x-%j.out
 
 echo "Running on compute node:"
@@ -16,13 +16,13 @@ mkdir -p /scratch/scholar/kapur16/attacks
 srun python -u shadow_attack.py \
     --checkpoint-dir ./checkpoints/10pct_seed42_overfit \
     --num_queries 2000 \
-    --num_shadow_models 32 \
+    --num_shadow_models 64 \
     --member-percentage 0.5 \
-    --mcmc-steps 250000 \
-    --burn-in 20000 \
-    --shadow-epochs 50 \
+    --mcmc-steps 1000000 \
+    --burn-in 200000 \
+    --shadow-epochs 100 \
     --prior-prob 0.5 \
-    --temperature 0.7 \
+    --temperature 1.0 \
     --use-final-model \
     --attack-dir /scratch/scholar/kapur16/attacks
 

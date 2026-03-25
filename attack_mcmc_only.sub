@@ -2,7 +2,7 @@
 #SBATCH -A gpu
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH -t 04:00:00
+#SBATCH -t 08:00:00
 #SBATCH -o logs/%x-%j.out
 
 echo "Running on compute node:"
@@ -16,15 +16,15 @@ mkdir -p logs
 #   - attack_data.npz
 #   - shadow_models/m_actual.npy
 #   - precomputed_matrices/influence_data.npz
-REUSE_RUN_DIR="/scratch/scholar/kapur16/attacks/run_20260310_134821"
+REUSE_RUN_DIR="/scratch/scholar/kapur16/attacks/10pct_seed42_overfit"
 
 # MCMC-only rerun (no shadow retraining)
 srun python -u shadow_attack.py \
     --checkpoint-dir ./checkpoints/10pct_seed42_overfit \
-    --num_shadow_models 32 \
-    --mcmc-steps 250000 \
-    --burn-in 20000 \
+    --num_shadow_models 64 \
+    --mcmc-steps 1000000 \
+    --burn-in 200000 \
     --prior-prob 0.5 \
-    --temperature 0.7 \
+    --temperature 1.0 \
     --use-final-model \
     --reuse-attack-run "$REUSE_RUN_DIR"

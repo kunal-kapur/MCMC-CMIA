@@ -626,17 +626,10 @@ def load_attack_inputs(attack_dir):
     ground_truth = attack_data['ground_truth']
     return query_indices, ground_truth
 
-def setup_attack_directory(base_dir="attacks"):
-    """Creates a unique timestamped directory for this attack run."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    attack_dir = os.path.join(base_dir, f"run_{timestamp}")
-
-    suffix = 1
-    while os.path.exists(attack_dir):
-        attack_dir = os.path.join(base_dir, f"run_{timestamp}_{suffix:02d}")
-        suffix += 1
-
-    os.makedirs(attack_dir, exist_ok=False)
+def setup_attack_directory(base_dir="attacks", model_name=None):
+    """Creates or resumes an attack directory named after the target model."""
+    attack_dir = os.path.join(base_dir, model_name)
+    os.makedirs(attack_dir, exist_ok=True)
     return attack_dir
 
 def load_target_metadata(meta_path):
@@ -707,14 +700,15 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     reuse_mode = args.reuse_attack_run is not None
+    checkpoint_dir = args.checkpoint_dir
+    model_name = os.path.basename(checkpoint_dir.rstrip("/"))
+
     if reuse_mode:
         attack_dir = args.reuse_attack_run
         if not os.path.exists(attack_dir):
             raise FileNotFoundError(f"Reuse run directory not found: {attack_dir}")
     else:
-        attack_dir = setup_attack_directory(base_dir=args.attack_dir)
-
-    checkpoint_dir = args.checkpoint_dir
+        attack_dir = setup_attack_directory(base_dir=args.attack_dir, model_name=model_name)
     meta_path = os.path.join(checkpoint_dir, "training_metadata.json")
 
     if not os.path.exists(meta_path):
