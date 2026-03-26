@@ -25,7 +25,6 @@ srun python -u shadow_attack.py \
     --mcmc-steps 200000 \
     --burn-in 20000 \
     --prior-prob 0.5 \
-    --prob-margin 0.05 \
     --temperature 1.0 \
     --use-final-model \
     --reuse-attack-run "$REUSE_RUN_DIR"

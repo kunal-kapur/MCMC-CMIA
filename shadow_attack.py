@@ -383,7 +383,7 @@ def precompute_influence_matrices(shadow_models, shadow_subsets, query_indices, 
     print("done precomputing influence matrices.")
     return np.array(C_matrices), np.array(t_bases)
 
-def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, attack_dir, target_fpr=0.01, prob_margin=0.01):
+def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, attack_dir):
     """
     Standard LiRA (Likelihood Ratio Attack) baseline — no MCMC, no influence functions.
 
@@ -402,6 +402,8 @@ def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, attack_dir
 
     Returns:
         lira_scores: Per-point LiRA log-likelihood ratio scores, shape (N,)
+        tpr_at_01pct: TPR at 0.1% FPR
+        tpr_at_1pct:  TPR at 1% FPR
     """
     N = len(target_scores)
     K = len(t_bases)
@@ -435,28 +437,12 @@ def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, attack_dir
 
     # Metrics
     fpr_curve, tpr_curve, _ = roc_curve(ground_truth, lira_probs)
-    valid = np.where(fpr_curve <= target_fpr)[0]
-    tpr_at_low_fpr = tpr_curve[valid[-1]] if len(valid) > 0 else float('nan')
+    valid_01 = np.where(fpr_curve <= 0.001)[0]
+    tpr_at_01pct = tpr_curve[valid_01[-1]] if len(valid_01) > 0 else float('nan')
+    valid_1 = np.where(fpr_curve <= 0.01)[0]
+    tpr_at_1pct = tpr_curve[valid_1[-1]] if len(valid_1) > 0 else float('nan')
 
-    accept_threshold = 1.0 - prob_margin
-    lira_preds = np.where(lira_probs >= accept_threshold, 1, 0)
-    tp = int(np.sum((lira_preds == 1) & (ground_truth == 1)))
-    fp = int(np.sum((lira_preds == 1) & (ground_truth == 0)))
-    tn = int(np.sum((lira_preds == 0) & (ground_truth == 0)))
-    fn = int(np.sum((lira_preds == 0) & (ground_truth == 1)))
-    accuracy = (tp + tn) / N if N > 0 else 0.0
-    tpr_val = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    fpr_val = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-
-    print(f"\n{'='*80}")
-    print(f"LIRA BASELINE RESULTS (standard LiRA, no MCMC)")
-    print(f"{'='*80}")
-    print(f"Accuracy (threshold={accept_threshold:.2f}): {accuracy:.2%} ({tp+tn}/{N})")
-    print(f"TPR: {tpr_val:.2%}  FPR: {fpr_val:.2%}")
-    print(f"TPR at {target_fpr*100:.0f}% FPR: {tpr_at_low_fpr * 100:.2f}%")
-    print(f"{'='*80}\n")
-
-    return lira_scores
+    return lira_scores, tpr_at_01pct, tpr_at_1pct
 
 
 def run_mcmc(target_scores, C_matrices, t_bases, m_actual, output_dir, num_steps=10000, prior_prob=0.5, temperature=0.7):
@@ -692,8 +678,6 @@ def main():
                         help='Temperature scaling for likelihood computation (default: 0.7)')
     parser.add_argument('--attack-dir', type=str, default="attacks",
                         help='Base directory to store attack results (default: attacks)')
-    parser.add_argument('--prob-margin', type=float, default=0.01,
-                        help='Decision margin x: prob <= x => 0 and prob >= 1-x => 1 (default: 0.01)')
     parser.add_argument('--reuse-attack-run', type=str, default=None,
                         help='Reuse an existing attack run directory and skip shadow retraining/influence precompute')
 
@@ -732,10 +716,6 @@ def main():
     BURN_IN = args.burn_in
     PRIOR_PROB = args.prior_prob
     TEMPERATURE = args.temperature
-    PROB_MARGIN = args.prob_margin
-
-    if not (0.0 <= PROB_MARGIN < 0.5):
-        raise ValueError(f"--prob-margin must be in [0.0, 0.5). Got {PROB_MARGIN}")
 
     attack_data_path = os.path.join(attack_dir, 'attack_data.npz')
     if reuse_mode or os.path.exists(attack_data_path):
@@ -763,7 +743,7 @@ def main():
     print(f"  - MCMC Steps: {MCMC_STEPS}")
     print(f"  - Burn-in: {BURN_IN}")
     print(f"  - Temperature: {TEMPERATURE}")
-    print(f"  - Probability Margin: {PROB_MARGIN}")
+    print(f"  - Target FPRs: 0.1%, 1.0%")
     if not reuse_mode:
         print(f"  - Member Percentage: {args.member_percentage * 100:.1f}%")
     
@@ -876,17 +856,6 @@ def main():
     print("Evaluating target model on query points...")
     target_scores = evaluate_target_model(target_model_path, query_indices, device)
 
-    TARGET_FPR = 0.01
-    run_lira_baseline(
-        target_scores,
-        t_bases,
-        m_actual,
-        ground_truth,
-        attack_dir,
-        target_fpr=TARGET_FPR,
-        prob_margin=PROB_MARGIN,
-    )
-
     print(f"Running MCMC for {NUM_QUERIES} points...")
     trace_path = run_mcmc(
         target_scores=target_scores,
@@ -911,60 +880,26 @@ def main():
 
     np.save(os.path.join(attack_dir, "posterior_std.npy"), posterior_std)
 
-    print(f"\n{'='*80}")
-    print("ATTACK RESULTS: Membership Predictions vs Ground Truth")
-    print(f"{'='*80}")
-
-    predictions = []
-    for prob in posterior_probs:
-        if prob >= 1.0 - PROB_MARGIN:
-            predictions.append('1')
-        elif prob <= PROB_MARGIN:
-            predictions.append('0')
-        else:
-            predictions.append('?')
-
-    num_to_show = min(100, len(query_indices))
-    header = "Point:      " + "  ".join([f"{i+1:>3}" for i in range(num_to_show)])
-    print(header)
-    print("-" * len(header))
-    pred_row = "Predicted:  " + "  ".join([f"{p:>3}" for p in predictions[:num_to_show]])
-    print(pred_row)
-
-    truth_row = "Actual:     " + "  ".join([f"{int(gt):>3}" for gt in ground_truth[:num_to_show]])
-    print(truth_row)
-
-    posterior_row = "Posterior:  " + "  ".join([f"{prob:.2f}" for prob in posterior_probs[:num_to_show]])
-    print(posterior_row)
-
-    tp = sum(1 for p, gt in zip(predictions, ground_truth) if p == '1' and gt == 1)
-    fp = sum(1 for p, gt in zip(predictions, ground_truth) if p == '1' and gt == 0)
-    tn = sum(1 for p, gt in zip(predictions, ground_truth) if p == '0' and gt == 0)
-    fn = sum(1 for p, gt in zip(predictions, ground_truth) if p == '0' and gt == 1)
-
-    correct = tp + tn
-    confident_predictions = sum(1 for p in predictions if p != '?')
-    accuracy = correct / confident_predictions if confident_predictions > 0 else 0
-
-    actual_positives = tp + fn
-    actual_negatives = fp + tn
-    tpr = tp / actual_positives if actual_positives > 0 else 0
-    fpr = fp / actual_negatives if actual_negatives > 0 else 0
-
-    print(f"\nConfident predictions: {confident_predictions}/{len(query_indices)}")
-    print(f"Accuracy on confident predictions: {accuracy:.2%} ({correct}/{confident_predictions})")
-    print(f"True Positive Rate (TPR): {tpr:.2%} ({tp}/{actual_positives})")
-    print(f"False Positive Rate (FPR): {fpr:.2%} ({fp}/{actual_negatives})")
-    print(f"{'='*80}\n")
-
     fpr_curve, tpr_curve, _ = roc_curve(ground_truth, posterior_probs)
-    valid_indices = np.where(fpr_curve <= TARGET_FPR)[0]
+    valid_01 = np.where(fpr_curve <= 0.001)[0]
+    mcmc_tpr_01pct = tpr_curve[valid_01[-1]] if len(valid_01) > 0 else float('nan')
+    valid_1 = np.where(fpr_curve <= 0.01)[0]
+    mcmc_tpr_1pct = tpr_curve[valid_1[-1]] if len(valid_1) > 0 else float('nan')
 
-    if len(valid_indices) > 0:
-        tpr_at_low_fpr = tpr_curve[valid_indices[-1]]
-        print(f"Success! TPR at {TARGET_FPR*100:.0f}% FPR: {tpr_at_low_fpr * 100:.2f}%")
-    else:
-        print(f"Could not measure {TARGET_FPR*100:.0f}% FPR. Need more non-member points or shadow models.")
+    _, lira_tpr_01pct, lira_tpr_1pct = run_lira_baseline(
+        target_scores,
+        t_bases,
+        m_actual,
+        ground_truth,
+        attack_dir,
+    )
+
+    print(f"\n{'='*80}")
+    print(f"FINAL COMPARISON")
+    print(f"{'='*80}")
+    print(f"  MCMC-CMIA:      TPR @ 0.1% FPR = {mcmc_tpr_01pct * 100:.2f}%  |  TPR @ 1% FPR = {mcmc_tpr_1pct * 100:.2f}%")
+    print(f"  LiRA (control): TPR @ 0.1% FPR = {lira_tpr_01pct * 100:.2f}%  |  TPR @ 1% FPR = {lira_tpr_1pct * 100:.2f}%")
+    print(f"{'='*80}\n")
 
 if __name__ == "__main__":
     main()
