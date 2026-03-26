@@ -16,6 +16,9 @@ import torchvision
 from global_variables import DATA_DIR, TRANSFORM_TRAIN, TRANSFORM_TEST
 import torchvision.datasets as datasets
 from sklearn.metrics import roc_curve
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 
 from resnet_influence import ResNet18_Influence
@@ -383,6 +386,55 @@ def precompute_influence_matrices(shadow_models, shadow_subsets, query_indices, 
     print("done precomputing influence matrices.")
     return np.array(C_matrices), np.array(t_bases)
 
+def plot_calibration(scores_dict, ground_truth, attack_dir):
+    """
+    Plot marginal calibration and ROC curves for one or more score sets.
+
+    scores_dict: {label: 1-D array of scores (higher = more likely member)}
+    Saves two PNG files to attack_dir:
+      - calibration_histogram.png  (score distribution, members vs non-members)
+      - roc_curve.png              (ROC with low-FPR inset)
+    """
+    members = ground_truth == 1
+    non_members = ~members
+
+    # --- Histogram ---
+    fig, axes = plt.subplots(1, len(scores_dict), figsize=(5 * len(scores_dict), 4), squeeze=False)
+    for ax, (label, scores) in zip(axes[0], scores_dict.items()):
+        ax.hist(scores[members],     bins=60, alpha=0.6, density=True, label='Member',     color='steelblue')
+        ax.hist(scores[non_members], bins=60, alpha=0.6, density=True, label='Non-Member', color='salmon')
+        ax.set_title(f'{label} score distribution')
+        ax.set_xlabel('Score')
+        ax.set_ylabel('Density')
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(attack_dir, 'calibration_histogram.png'), dpi=120)
+    plt.close(fig)
+
+    # --- ROC curve ---
+    fig, (ax_full, ax_low) = plt.subplots(1, 2, figsize=(12, 5))
+    for label, scores in scores_dict.items():
+        fpr, tpr, _ = roc_curve(ground_truth, scores)
+        ax_full.plot(fpr, tpr, label=label)
+        # Low-FPR inset (0–2%)
+        mask = fpr <= 0.02
+        ax_low.plot(fpr[mask], tpr[mask], label=label)
+
+    for ax, title in [(ax_full, 'Full ROC'), (ax_low, 'ROC — FPR ≤ 2%')]:
+        ax.plot([0, 1], [0, 1], 'k--', linewidth=0.8)
+        ax.set_xlabel('FPR')
+        ax.set_ylabel('TPR')
+        ax.set_title(title)
+        ax.legend()
+        ax.axvline(0.001, color='gray', linestyle=':', linewidth=0.8, label='0.1% FPR')
+        ax.axvline(0.01,  color='gray', linestyle='--', linewidth=0.8, label='1% FPR')
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(attack_dir, 'roc_curve.png'), dpi=120)
+    plt.close(fig)
+    print(f"Saved calibration plots to {attack_dir}/")
+
+
 def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, attack_dir):
     """
     Standard LiRA (Likelihood Ratio Attack) baseline — no MCMC, no influence functions.
@@ -445,7 +497,7 @@ def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, attack_dir
     return lira_scores, tpr_at_01pct, tpr_at_1pct
 
 
-def run_mcmc(target_scores, C_matrices, t_bases, m_actual, output_dir, num_steps=10000, prior_prob=0.5, temperature=0.7):
+def run_mcmc(target_scores, C_matrices, t_bases, m_actual, output_dir, num_steps=10000, prior_prob=0.5, temperature=0.7, use_influence=True):
     N = len(target_scores)
     K = len(C_matrices)
     global_std = np.std(t_bases, ddof=1) + 1e-8
@@ -466,7 +518,10 @@ def run_mcmc(target_scores, C_matrices, t_bases, m_actual, output_dir, num_steps
     delta_current = M_current - m_actual
     
     # This expensive O(N^2) math happens EXACTLY ONCE
-    t_shifted_current = t_bases + (C_matrices @ delta_current[..., None]).squeeze(-1)
+    if use_influence:
+        t_shifted_current = t_bases + (C_matrices @ delta_current[..., None]).squeeze(-1)
+    else:
+        t_shifted_current = t_bases.copy()
 
     def compute_log_likelihood(M_prop, t_shifted):
         """Now takes t_shifted as an argument so we don't recalculate it"""
@@ -514,7 +569,10 @@ def run_mcmc(target_scores, C_matrices, t_bases, m_actual, output_dir, num_steps
         # 2. Incrementally update t_shifted in O(N) time!
         # If we flipped 0 -> 1, delta increased by 1. If 1 -> 0, delta decreased by 1.
         flip_direction = 1 if M_prop[flip_idx] == 1 else -1
-        t_shifted_prop = t_shifted_current + (flip_direction * C_matrices[:, :, flip_idx])
+        if use_influence:
+            t_shifted_prop = t_shifted_current + (flip_direction * C_matrices[:, :, flip_idx])
+        else:
+            t_shifted_prop = t_shifted_current
         
         # 3. Compute new probabilities
         prop_log_lik = compute_log_likelihood(M_prop, t_shifted_prop)
@@ -680,6 +738,8 @@ def main():
                         help='Base directory to store attack results (default: attacks)')
     parser.add_argument('--reuse-attack-run', type=str, default=None,
                         help='Reuse an existing attack run directory and skip shadow retraining/influence precompute')
+    parser.add_argument('--ablate-influence', action='store_true',
+                        help='Debug ablation: disable influence matrix C so MCMC runs on raw LiRA scores only')
 
     
     args = parser.parse_args()
@@ -856,7 +916,9 @@ def main():
     print("Evaluating target model on query points...")
     target_scores = evaluate_target_model(target_model_path, query_indices, device)
 
-    print(f"Running MCMC for {NUM_QUERIES} points...")
+    use_influence = not args.ablate_influence
+    mcmc_label = "MCMC-CMIA" if use_influence else "MCMC (no-C ablation)"
+    print(f"Running MCMC for {NUM_QUERIES} points (use_influence={use_influence})...")
     trace_path = run_mcmc(
         target_scores=target_scores,
         C_matrices=C_matrices,
@@ -865,7 +927,8 @@ def main():
         output_dir=attack_dir,
         num_steps=MCMC_STEPS,
         prior_prob=PRIOR_PROB,
-        temperature=TEMPERATURE
+        temperature=TEMPERATURE,
+        use_influence=use_influence,
     )
 
     posterior_probs, posterior_std = aggregate_posterior(
@@ -886,7 +949,7 @@ def main():
     valid_1 = np.where(fpr_curve <= 0.01)[0]
     mcmc_tpr_1pct = tpr_curve[valid_1[-1]] if len(valid_1) > 0 else float('nan')
 
-    _, lira_tpr_01pct, lira_tpr_1pct = run_lira_baseline(
+    lira_scores, lira_tpr_01pct, lira_tpr_1pct = run_lira_baseline(
         target_scores,
         t_bases,
         m_actual,
@@ -894,10 +957,16 @@ def main():
         attack_dir,
     )
 
+    plot_calibration(
+        {mcmc_label: posterior_probs, "LiRA (control)": lira_scores},
+        ground_truth,
+        attack_dir,
+    )
+
     print(f"\n{'='*80}")
     print(f"FINAL COMPARISON")
     print(f"{'='*80}")
-    print(f"  MCMC-CMIA:      TPR @ 0.1% FPR = {mcmc_tpr_01pct * 100:.2f}%  |  TPR @ 1% FPR = {mcmc_tpr_1pct * 100:.2f}%")
+    print(f"  {mcmc_label}:  TPR @ 0.1% FPR = {mcmc_tpr_01pct * 100:.2f}%  |  TPR @ 1% FPR = {mcmc_tpr_1pct * 100:.2f}%")
     print(f"  LiRA (control): TPR @ 0.1% FPR = {lira_tpr_01pct * 100:.2f}%  |  TPR @ 1% FPR = {lira_tpr_1pct * 100:.2f}%")
     print(f"{'='*80}\n")
 
