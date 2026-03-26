@@ -383,7 +383,7 @@ def precompute_influence_matrices(shadow_models, shadow_subsets, query_indices, 
     print("done precomputing influence matrices.")
     return np.array(C_matrices), np.array(t_bases)
 
-def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, attack_dir, target_fpr=0.01):
+def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, attack_dir, target_fpr=0.01, prob_margin=0.01):
     """
     Standard LiRA (Likelihood Ratio Attack) baseline — no MCMC, no influence functions.
 
@@ -438,7 +438,8 @@ def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, attack_dir
     valid = np.where(fpr_curve <= target_fpr)[0]
     tpr_at_low_fpr = tpr_curve[valid[-1]] if len(valid) > 0 else float('nan')
 
-    lira_preds = np.where(lira_probs >= 0.5, 1, 0)
+    accept_threshold = 1.0 - prob_margin
+    lira_preds = np.where(lira_probs >= accept_threshold, 1, 0)
     tp = int(np.sum((lira_preds == 1) & (ground_truth == 1)))
     fp = int(np.sum((lira_preds == 1) & (ground_truth == 0)))
     tn = int(np.sum((lira_preds == 0) & (ground_truth == 0)))
@@ -450,7 +451,7 @@ def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, attack_dir
     print(f"\n{'='*80}")
     print(f"LIRA BASELINE RESULTS (standard LiRA, no MCMC)")
     print(f"{'='*80}")
-    print(f"Accuracy (threshold=0.5): {accuracy:.2%} ({tp+tn}/{N})")
+    print(f"Accuracy (threshold={accept_threshold:.2f}): {accuracy:.2%} ({tp+tn}/{N})")
     print(f"TPR: {tpr_val:.2%}  FPR: {fpr_val:.2%}")
     print(f"TPR at {target_fpr*100:.0f}% FPR: {tpr_at_low_fpr * 100:.2f}%")
     print(f"{'='*80}\n")
@@ -691,6 +692,8 @@ def main():
                         help='Temperature scaling for likelihood computation (default: 0.7)')
     parser.add_argument('--attack-dir', type=str, default="attacks",
                         help='Base directory to store attack results (default: attacks)')
+    parser.add_argument('--prob-margin', type=float, default=0.01,
+                        help='Decision margin x: prob <= x => 0 and prob >= 1-x => 1 (default: 0.01)')
     parser.add_argument('--reuse-attack-run', type=str, default=None,
                         help='Reuse an existing attack run directory and skip shadow retraining/influence precompute')
 
@@ -729,6 +732,10 @@ def main():
     BURN_IN = args.burn_in
     PRIOR_PROB = args.prior_prob
     TEMPERATURE = args.temperature
+    PROB_MARGIN = args.prob_margin
+
+    if not (0.0 <= PROB_MARGIN < 0.5):
+        raise ValueError(f"--prob-margin must be in [0.0, 0.5). Got {PROB_MARGIN}")
 
     attack_data_path = os.path.join(attack_dir, 'attack_data.npz')
     if reuse_mode or os.path.exists(attack_data_path):
@@ -756,6 +763,7 @@ def main():
     print(f"  - MCMC Steps: {MCMC_STEPS}")
     print(f"  - Burn-in: {BURN_IN}")
     print(f"  - Temperature: {TEMPERATURE}")
+    print(f"  - Probability Margin: {PROB_MARGIN}")
     if not reuse_mode:
         print(f"  - Member Percentage: {args.member_percentage * 100:.1f}%")
     
@@ -869,7 +877,15 @@ def main():
     target_scores = evaluate_target_model(target_model_path, query_indices, device)
 
     TARGET_FPR = 0.01
-    run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, attack_dir, target_fpr=TARGET_FPR)
+    run_lira_baseline(
+        target_scores,
+        t_bases,
+        m_actual,
+        ground_truth,
+        attack_dir,
+        target_fpr=TARGET_FPR,
+        prob_margin=PROB_MARGIN,
+    )
 
     print(f"Running MCMC for {NUM_QUERIES} points...")
     trace_path = run_mcmc(
@@ -901,9 +917,9 @@ def main():
 
     predictions = []
     for prob in posterior_probs:
-        if prob >= 0.99:
+        if prob >= 1.0 - PROB_MARGIN:
             predictions.append('1')
-        elif prob <= 0.01:
+        elif prob <= PROB_MARGIN:
             predictions.append('0')
         else:
             predictions.append('?')

@@ -1,1 +1,0 @@
-python shadow_attack.py --checkpoint-dir ./checkpoints/model1 --num_queries 1000
