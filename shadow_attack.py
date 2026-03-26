@@ -730,9 +730,12 @@ def main():
     PRIOR_PROB = args.prior_prob
     TEMPERATURE = args.temperature
 
-    if reuse_mode:
+    attack_data_path = os.path.join(attack_dir, 'attack_data.npz')
+    if reuse_mode or os.path.exists(attack_data_path):
         query_indices, ground_truth = load_attack_inputs(attack_dir)
         NUM_QUERIES = len(query_indices)
+        if not reuse_mode:
+            print(f"Resuming existing run — loaded {NUM_QUERIES} query points from {attack_data_path}")
     else:
         NUM_QUERIES = args.num_queries
         query_indices, ground_truth = setup_query_points(
@@ -740,6 +743,7 @@ def main():
             num_queries=NUM_QUERIES,
             member_percentage=args.member_percentage,
         )
+        save_attack_inputs(attack_dir, query_indices, ground_truth)
 
     print(f"Attack configuration:")
     print(f"  - Checkpoint Directory: {checkpoint_dir}")
@@ -754,9 +758,6 @@ def main():
     print(f"  - Temperature: {TEMPERATURE}")
     if not reuse_mode:
         print(f"  - Member Percentage: {args.member_percentage * 100:.1f}%")
-
-    if not reuse_mode:
-        save_attack_inputs(attack_dir, query_indices, ground_truth)
     
     # Load target metadata for dataset sizes and training configuration
     with open(meta_path, 'r') as f:
