@@ -860,6 +860,11 @@ def main():
                 t_bases=t_bases
             )
 
+        del shadow_models
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     print("Evaluating target model on query points...")
     target_scores = evaluate_target_model(target_model_path, query_indices, device)
 
