@@ -18,7 +18,6 @@ srun python -u shadow_attack.py \
     --num_shadow_models 64 \
     --member-percentage 0.5 \
     --shadow-epochs 100 \
-    --prior-prob 0.5 \
     --use-final-model \
     --analyze-influence \
     --attack-dir /scratch/scholar/kapur16/attacks

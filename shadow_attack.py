@@ -11,7 +11,6 @@ from torch.utils.data import DataLoader, Subset
 
 import numpy as np
 from scipy.stats import norm
-from scipy.stats import t
 import torchvision
 from global_variables import DATA_DIR, TRANSFORM_TRAIN, TRANSFORM_TEST
 import torchvision.datasets as datasets
@@ -641,48 +640,6 @@ def setup_query_points(meta_path, num_queries=1000, total_dataset_size=50000, me
     ground_truth = np.array([1 if idx in true_members else 0 for idx in query_indices])
     return query_indices, ground_truth
 
-def run_bayesian_lira(target_scores, t_bases, m_actual, ground_truth, prior_prob, target_fprs=(0.001, 0.01)):
-    N = len(target_scores)
-    K = len(t_bases)
-    global_std = np.std(t_bases, ddof=1) + 1e-8
-
-    posteriors = np.zeros(N, dtype=np.float64)
-
-    for i in range(N):
-        in_scores  = t_bases[m_actual[:, i] == 1, i]
-        out_scores = t_bases[m_actual[:, i] == 0, i]
-
-        mu_in  = np.mean(in_scores)  if len(in_scores)  > 0 else 0.0
-        mu_out = np.mean(out_scores) if len(out_scores) > 0 else 0.0
-        std_in  = np.std(in_scores,  ddof=1) if len(in_scores)  > 1 else global_std
-        std_out = np.std(out_scores, ddof=1) if len(out_scores) > 1 else global_std
-        std_in  = std_in  if std_in  > 0 else global_std
-        std_out = std_out if std_out > 0 else global_std
-
-        t_i = target_scores[i]
-
-        log_p_in  = norm.logpdf(t_i, loc=mu_in,  scale=std_in)
-        log_p_out = norm.logpdf(t_i, loc=mu_out, scale=std_out)
-
-        log_prior_in  = np.log(prior_prob + 1e-12)
-        log_prior_out = np.log(1 - prior_prob + 1e-12)
-
-        log_num = log_prior_in + log_p_in
-        m = max(log_prior_in + log_p_in, log_prior_out + log_p_out)
-        log_den = m + np.log(
-            np.exp(log_prior_in + log_p_in - m) +
-            np.exp(log_prior_out + log_p_out - m)
-        )
-
-        posteriors[i] = np.exp(log_num - log_den)
-
-    fpr_curve, tpr_curve, _ = roc_curve(ground_truth, posteriors)
-    tprs = {}
-    for fpr_target in target_fprs:
-        valid = np.where(fpr_curve <= fpr_target)[0]
-        tprs[fpr_target] = tpr_curve[valid[-1]] if len(valid) > 0 else float('nan')
-    return posteriors, tprs
-
 
 def per_point_influence_norms(model, dataloader, criterion, device):
     model.eval()
@@ -699,8 +656,8 @@ def per_point_influence_norms(model, dataloader, criterion, device):
             norms.extend(batch_norms)
     return np.array(norms)
 
-def plot_bucket_posterior_hist(
-    bayes_posteriors: np.ndarray,
+def plot_bucket_lira_hist(
+    lira_scores: np.ndarray,
     ground_truth: np.ndarray,
     bucket_indices: np.ndarray,
     bucket_id: int,
@@ -708,20 +665,18 @@ def plot_bucket_posterior_hist(
     title_prefix: str = "",
 ) -> None:
     """
-    Plot histogram of Bayesian LiRA posteriors in a given bucket,
+    Plot histogram of LiRA log-LR scores in a given bucket,
     split by members vs non-members.
     """
-    bucket_post = bayes_posteriors[bucket_indices]
-    bucket_gt   = ground_truth[bucket_indices]
+    bucket_scores = lira_scores[bucket_indices]
+    bucket_gt     = ground_truth[bucket_indices]
 
-    in_mask  = bucket_gt == 1
-    out_mask = bucket_gt == 0
-
-    in_vals  = bucket_post[in_mask]
-    out_vals = bucket_post[out_mask]
+    in_vals  = bucket_scores[bucket_gt == 1]
+    out_vals = bucket_scores[bucket_gt == 0]
 
     plt.figure(figsize=(6, 4))
-    bins = np.linspace(0.0, 1.0, 41)
+    all_vals = np.concatenate([in_vals, out_vals])
+    bins = np.linspace(all_vals.min(), all_vals.max(), 41) if len(all_vals) > 1 else 40
 
     if len(out_vals) > 0:
         plt.hist(out_vals, bins=bins, alpha=0.6, label="Non-members",
@@ -730,7 +685,7 @@ def plot_bucket_posterior_hist(
         plt.hist(in_vals, bins=bins, alpha=0.6, label="Members",
                  color="tab:orange", density=True)
 
-    plt.xlabel("Bayesian LiRA posterior")
+    plt.xlabel("LiRA log-likelihood ratio")
     plt.ylabel("Density")
     prefix = f"{title_prefix} " if title_prefix else ""
     plt.title(f"{prefix}Bucket {bucket_id} (n={len(bucket_indices)})")
@@ -740,14 +695,14 @@ def plot_bucket_posterior_hist(
     plots_dir = os.path.join(attack_dir, "bucket_plots")
     os.makedirs(plots_dir, exist_ok=True)
     safe_prefix = "".join(c if c.isalnum() or c in "-_" else "_" for c in title_prefix.lower())
-    out_path = os.path.join(plots_dir, f"{safe_prefix}_bucket_{bucket_id}_posterior_hist.png")
+    out_path = os.path.join(plots_dir, f"{safe_prefix}_bucket_{bucket_id}_lira_hist.png")
     plt.savefig(out_path)
     plt.close()
 
 
 def _plot_bucket_tpr_comparison(
     scores_dict: dict,
-    bayes_posteriors: np.ndarray,
+    lira_scores: np.ndarray,
     ground_truth: np.ndarray,
     attack_dir: str,
     num_buckets: int = 5,
@@ -770,7 +725,7 @@ def _plot_bucket_tpr_comparison(
             if len(idx) < 10:
                 tprs.append(float("nan"))
                 continue
-            fpr, tpr, _ = roc_curve(ground_truth[idx], bayes_posteriors[idx])
+            fpr, tpr, _ = roc_curve(ground_truth[idx], lira_scores[idx])
             valid = np.where(fpr <= 0.01)[0]
             tprs.append(tpr[valid[-1]] * 100 if len(valid) > 0 else float("nan"))
         offset = (i - (len(scores_dict) - 1) / 2) * width
@@ -780,7 +735,7 @@ def _plot_bucket_tpr_comparison(
     ax.set_xticklabels(bucket_labels)
     ax.set_xlabel("Score quintile bucket")
     ax.set_ylabel("TPR @ 1% FPR (%)")
-    ax.set_title("Bayesian LiRA TPR@1%FPR by influence-score quintile")
+    ax.set_title("LiRA TPR@1%FPR by influence-score quintile")
     ax.legend()
     ax.axhline(1.0, color="gray", linestyle="--", linewidth=0.8, label="Random (1%)")
     fig.tight_layout()
@@ -792,12 +747,12 @@ def _plot_bucket_tpr_comparison(
 
 def analyze_influence_vs_lira(
     attack_dir: str,
-    bayes_posteriors: np.ndarray,
+    lira_scores: np.ndarray,
     ground_truth: np.ndarray,
     target_model_path: str,
     device,
 ):
-    print("\n[Analysis] Influence vs Bayesian LiRA vulnerability")
+    print("\n[Analysis] Influence vs LiRA vulnerability")
 
     precomputed_dir = os.path.join(attack_dir, "precomputed_matrices")
     influence_cache_path = os.path.join(precomputed_dir, "influence_data.npz")
@@ -807,7 +762,6 @@ def analyze_influence_vs_lira(
         print("  Missing influence or attack artifacts; skipping analysis.")
         return
 
-    # Load influence matrices and attack data
     influence_data = np.load(influence_cache_path)
     C_matrices = influence_data["C_matrices"]          # [K, N, N]
     C_loss_matrices = influence_data["C_loss_matrices"] if "C_loss_matrices" in influence_data else None
@@ -817,14 +771,14 @@ def analyze_influence_vs_lira(
     ground_truth = attack_data["ground_truth"]
 
     # --- Score: LiRA-vs-loss column norm ---
-    C_mean_lira = C_matrices.mean(axis=0)                      # [N, N]
-    scores_C_lira = np.linalg.norm(C_mean_lira, axis=0)        # [N]
+    C_mean_lira = C_matrices.mean(axis=0)
+    scores_C_lira = np.linalg.norm(C_mean_lira, axis=0)
     scores_C_lira = (scores_C_lira - scores_C_lira.mean()) / (scores_C_lira.std() + 1e-8)
 
-    # --- Score: loss-vs-loss column norm (only if cached) ---
+    # --- Score: loss-vs-loss column norm ---
     if C_loss_matrices is not None:
-        C_mean_loss = C_loss_matrices.mean(axis=0)              # [N, N]
-        scores_C_loss = np.linalg.norm(C_mean_loss, axis=0)    # [N]
+        C_mean_loss = C_loss_matrices.mean(axis=0)
+        scores_C_loss = np.linalg.norm(C_mean_loss, axis=0)
         scores_C_loss = (scores_C_loss - scores_C_loss.mean()) / (scores_C_loss.std() + 1e-8)
     else:
         print("  WARNING: C_loss_matrices not found in cache; loss-only score unavailable.")
@@ -835,14 +789,13 @@ def analyze_influence_vs_lira(
     scores_grad = compute_grad_norms_last_layer(target_model_path, query_indices, device)
     scores_grad = (scores_grad - scores_grad.mean()) / (scores_grad.std() + 1e-8)
 
-    # Build the dict of scores to analyse (skip loss score if unavailable)
     scores_dict = {"C-LiRA (lira-vs-loss)": scores_C_lira, "Grad-norm last layer": scores_grad}
     if scores_C_loss is not None:
         scores_dict["C-Loss (loss-vs-loss)"] = scores_C_loss
 
     def analyze_score(score_name: str, scores: np.ndarray) -> None:
-        corr = np.corrcoef(scores, bayes_posteriors)[0, 1]
-        print(f"\n  [{score_name}] Pearson corr(score, Bayesian LiRA posterior): {corr:.3f}")
+        corr = np.corrcoef(scores, lira_scores)[0, 1]
+        print(f"\n  [{score_name}] Pearson corr(score, LiRA log-LR): {corr:.3f}")
 
         num_buckets = 5
         quantiles = np.quantile(scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
@@ -854,12 +807,12 @@ def analyze_influence_vs_lira(
             if len(idx) < 10:
                 print(f"    Bucket {b}: too few points ({len(idx)}), skipping")
                 continue
-            fpr, tpr, _ = roc_curve(ground_truth[idx], bayes_posteriors[idx])
+            fpr, tpr, _ = roc_curve(ground_truth[idx], lira_scores[idx])
             valid = np.where(fpr <= 0.01)[0]
             tpr_1pct = tpr[valid[-1]] if len(valid) > 0 else float("nan")
             print(f"    Bucket {b}: size={len(idx)}, TPR@1%FPR={tpr_1pct * 100:.2f}%")
-            plot_bucket_posterior_hist(
-                bayes_posteriors=bayes_posteriors,
+            plot_bucket_lira_hist(
+                lira_scores=lira_scores,
                 ground_truth=ground_truth,
                 bucket_indices=idx,
                 bucket_id=b,
@@ -870,13 +823,12 @@ def analyze_influence_vs_lira(
     for name, scores in scores_dict.items():
         analyze_score(name, scores)
 
-    # Grouped bar chart comparing all score types side-by-side
-    _plot_bucket_tpr_comparison(scores_dict, bayes_posteriors, ground_truth, attack_dir)
+    _plot_bucket_tpr_comparison(scores_dict, lira_scores, ground_truth, attack_dir)
 
     save_dict = dict(
         scores_C_lira=scores_C_lira,
         scores_grad=scores_grad,
-        bayes_posteriors=bayes_posteriors,
+        lira_scores=lira_scores,
         ground_truth=ground_truth,
         query_indices=query_indices,
     )
@@ -893,7 +845,6 @@ def main():
     parser.add_argument('--num_queries', type=int, default=1000)
     parser.add_argument('--num_shadow_models', type=int, default=16)
     parser.add_argument('--checkpoint-dir', type=str, required=True)
-    parser.add_argument('--prior-prob', type=float, required=True)
     parser.add_argument('--use-final-model', action='store_true')
     parser.add_argument('--member-percentage', type=float, default=0.5)
     parser.add_argument('--shadow-epochs', type=int, default=None)
@@ -1040,7 +991,6 @@ def main():
     target_scores = evaluate_target_model(target_model_path, query_indices, device)
 
     # 6. LiRA baseline (unchanged)
-    TARGET_FPRS = (0.001, 0.01)
     lira_scores, lira_tpr_01pct, lira_tpr_1pct = run_lira_baseline(
         target_scores,
         t_bases,
@@ -1049,43 +999,23 @@ def main():
         attack_dir,
     )
 
-    # 7. Bayesian LiRA (per-point posterior)
-    print("Running Bayesian LiRA (per-point posterior)...")
-    bayes_posteriors, bayes_tprs = run_bayesian_lira(
-        target_scores=target_scores,
-        t_bases=t_bases,
-        m_actual=m_actual,
-        ground_truth=ground_truth,
-        prior_prob=args.prior_prob,
-        target_fprs=TARGET_FPRS,
-    )
     if args.analyze_influence:
         analyze_influence_vs_lira(
             attack_dir=attack_dir,
-            bayes_posteriors=bayes_posteriors,
+            lira_scores=lira_scores,
             ground_truth=ground_truth,
             target_model_path=target_model_path,
             device=device,
         )
-    # 8. Calibration / plots
-    plot_calibration(
-        {
-            "LiRA (control)": lira_scores,
-            "Bayesian LiRA": bayes_posteriors,
-        },
-        ground_truth,
-        attack_dir,
-    )
 
-    # 9. Final printout
-    bayes_tpr_01pct = bayes_tprs[0.001]
-    bayes_tpr_1pct  = bayes_tprs[0.01]
+    # 7. Calibration / plots
+    plot_calibration({"LiRA": lira_scores}, ground_truth, attack_dir)
 
+    # 8. Final printout
     print(f"\n{'='*80}")
-    print(f"FINAL COMPARISON")
+    print(f"RESULTS")
     print(f"{'='*80}")
-    print(f"  LiRA (control):    TPR @ 0.1% FPR = {lira_tpr_01pct * 100:.2f}%  |  TPR @ 1% FPR = {lira_tpr_1pct * 100:.2f}%")
-    print(f"  Bayesian LiRA:     TPR @ 0.1% FPR = {bayes_tpr_01pct * 100:.2f}%  |  TPR @ 1% FPR = {bayes_tpr_1pct * 100:.2f}%")
+    print(f"  LiRA:  TPR @ 0.1% FPR = {lira_tpr_01pct * 100:.2f}%  |  TPR @ 1% FPR = {lira_tpr_1pct * 100:.2f}%")
     print(f"{'='*80}\n")
 
 if __name__ == "__main__":
