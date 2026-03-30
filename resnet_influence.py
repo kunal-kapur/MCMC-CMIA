@@ -175,55 +175,73 @@ class ResNet_Influence(nn.Module):
         g_test  = self.get_last_layer_grad(x_test,  y_test,  criterion)
         return -(g_test @ H_inv @ g_train).item()
     
-    def compute_influence_matrix(self, dataloader, H_inv, train_dataset_size, device):
-        """
-        Precomputes the N x N influence matrix C where C[j, i] is the 
-        change in the LiRA statistic (scaled logit) for point j if 
-        point i is added to the training set.
-        """
+    def _collect_feats_and_labels(self, dataloader, device):
+        """Pass data through the backbone and return (all_feats, all_labels, all_feats_aug)."""
         self.eval()
-        
-        # 1. Collect all features and true labels
         all_feats = []
         all_labels = []
         with torch.no_grad():
             for x, y in dataloader:
                 x = x.to(device)
-                logits, feats = self.forward(x, return_features=True)
+                _, feats = self.forward(x, return_features=True)
                 all_feats.append(feats)
                 all_labels.append(y.to(device))
-                
-        all_feats = torch.cat(all_feats, dim=0)    # [N, 512]
+        all_feats = torch.cat(all_feats, dim=0)    # [N, F]
         all_labels = torch.cat(all_labels, dim=0)  # [N]
         N = all_feats.size(0)
+        all_feats_aug = torch.cat([all_feats, torch.ones(N, 1, device=device)], dim=1)  # [N, F+1]
+        return all_feats, all_labels, all_feats_aug
 
+    def _get_last_layer_grad_matrices(self, all_feats_aug, all_labels):
+        """
+        Single linear pass returning both gradient matrices.
+
+        G_loss[n] = (p_n - e_{y_n}) ⊗ f_n        (gradient of CE loss)
+        G_lira[n] = G_loss[n] / (p_true_n - 1)   (gradient of LiRA logit statistic)
+
+        Returns:
+            G_loss : [N, P]   P = num_classes * (in_features + 1)
+            G_lira : [N, P]
+        """
         with torch.no_grad():
-            logits = self.linear(all_feats)        # [N, C]
-            probs = torch.softmax(logits, dim=1)   # [N, C]
-            
+            logits = self.linear(all_feats_aug[:, :-1])        # [N, C]
+            probs  = torch.softmax(logits, dim=1)               # [N, C]
             y_onehot = F.one_hot(all_labels, num_classes=self.num_classes).float()
-            
+            d_logits = probs - y_onehot                         # [N, C]  ∇_logits CE
 
-            # Inside compute_influence_matrix
-            d_logits = probs - y_onehot  # Gradient of Cross-Entropy Loss
-
-            # Get true class probabilities for the LiRA gradient scalar
-            p_true = probs.gather(1, all_labels.unsqueeze(1))
+            p_true = probs.gather(1, all_labels.unsqueeze(1))   # [N, 1]
             p_true = torch.clamp(p_true, min=1e-7, max=1.0 - 1e-7)
-            # Gradient of LiRA statistic t = log(p/(1-p))
-            d_logits_lira = d_logits / (p_true - 1.0)
+            d_logits_lira = d_logits / (p_true - 1.0)          # [N, C]  ∇_logits LiRA
 
-            all_feats_aug = torch.cat([all_feats, torch.ones(N, 1, device=device)], dim=1)
-
-            # G_loss is the influence source (training points)
-            G_loss = torch.einsum('nc,nf->ncf', d_logits, all_feats_aug).reshape(N, -1)
-            # G_lira is the influence target (evaluating the shifted statistic)
+            N = all_feats_aug.size(0)
+            G_loss = torch.einsum('nc,nf->ncf', d_logits,      all_feats_aug).reshape(N, -1)
             G_lira = torch.einsum('nc,nf->ncf', d_logits_lira, all_feats_aug).reshape(N, -1)
+        return G_loss, G_lira  # each [N, P]
 
-            # Matrix multiplication uses target (G_lira) and source (G_loss)
-        C = -(G_lira @ H_inv @ G_loss.T) / train_dataset_size
+    def compute_influence_matrices(self, dataloader, H_inv, train_dataset_size, device):
+        """
+        Computes both influence matrices in a single forward pass, sharing H_inv @ G_loss.T:
 
-        return C
+          C_lira = -(1/N_train) * G_lira @ H_inv @ G_loss.T   (LiRA-vs-loss)
+          C_loss = -(1/N_train) * G_loss @ H_inv @ G_loss.T   (loss-vs-loss)
+
+        Returns:
+            C_lira : [N, N]
+            C_loss : [N, N]
+        """
+        self.eval()
+        _, all_labels, all_feats_aug = self._collect_feats_and_labels(dataloader, device)
+        G_loss, G_lira = self._get_last_layer_grad_matrices(all_feats_aug, all_labels)
+        # Compute H_inv @ G_loss.T once and reuse for both matrices
+        H_inv_Gl_T = H_inv @ G_loss.T                           # [P, N]
+        C_lira = -(G_lira @ H_inv_Gl_T) / train_dataset_size
+        C_loss = -(G_loss @ H_inv_Gl_T) / train_dataset_size
+        return C_lira, C_loss
+
+    # Thin wrapper kept for any external callers that only want C_lira.
+    def compute_influence_matrix(self, dataloader, H_inv, train_dataset_size, device):
+        C_lira, _ = self.compute_influence_matrices(dataloader, H_inv, train_dataset_size, device)
+        return C_lira
     
     
     def get_lira_statistics(self, dataloader, device):

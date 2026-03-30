@@ -338,52 +338,54 @@ def train_shadow_models(query_indices, num_models, total_dataset_size, target_tr
 
 def precompute_influence_matrices(shadow_models, shadow_subsets, query_indices, device, hessian_sample_size=3000):
     """
-    Calculate Hessian and Influence matrix C using a subsampled Hessian for speed.
+    Calculate Hessian and both Influence matrices (LiRA-vs-loss and loss-vs-loss)
+    using a subsampled Hessian for speed.
     Note: shadow_subsets MUST be the list of exact index arrays each model was trained on.
     """
     C_matrices = []
+    C_loss_matrices = []
     t_bases = []
-    
+
     full_dataset = datasets.CIFAR10(root=DATA_DIR, train=True, download=False, transform=TRANSFORM_TEST)
-    
+
     for k, model in enumerate(shadow_models):
         print(f"  -> Precomputing Influence for Shadow Model {k+1}/{len(shadow_models)}...")
         model = model.to(device)
-        
+
         # 1. FAST HESSIAN APPROXIMATION
         train_indices = shadow_subsets[k]
-        
+
         # Randomly subsample the training set to compute the Hessian quickly
         sample_size = min(hessian_sample_size, len(train_indices))
         hessian_indices = np.random.choice(train_indices, sample_size, replace=False)
         hessian_subset = Subset(full_dataset, hessian_indices)
-        
+
         hessian_loader = DataLoader(hessian_subset, batch_size=256, shuffle=False, num_workers=0)
-        
+
         # Compute H on the subsample
         H = model.compute_last_layer_hessian(hessian_loader, device)
         H_inv = torch.linalg.inv(H)
-        
-        # 2. INFLUENCE MATRIX FOR QUERY POINTS ONLY
-        # This remains N x N just for the influence points!
+
+        # 2. INFLUENCE MATRICES FOR QUERY POINTS ONLY
         query_subset = Subset(full_dataset, [int(idx) for idx in query_indices])
         query_loader = DataLoader(query_subset, batch_size=256, shuffle=False)
-        
-        # Pass the TRUE train size (len(train_indices)), not the subsample size, 
+
+        # Pass the TRUE train size (len(train_indices)), not the subsample size,
         # to ensure the 1/N scaling is mathematically correct
-        train_size = len(train_indices) 
-        C = model.compute_influence_matrix(query_loader, H_inv, train_size,device)
+        train_size = len(train_indices)
+        C, C_loss = model.compute_influence_matrices(query_loader, H_inv, train_size, device)
         C_matrices.append(C.cpu().numpy())
-        
-        t_base = model.get_lira_statistics(query_loader, device) 
+        C_loss_matrices.append(C_loss.cpu().numpy())
+
+        t_base = model.get_lira_statistics(query_loader, device)
         t_bases.append(t_base.cpu().numpy())
-        
+
         # memory clean up
         model = model.cpu()
-        del H, H_inv, C
+        del H, H_inv, C, C_loss
         torch.cuda.empty_cache()
     print("done precomputing influence matrices.")
-    return np.array(C_matrices), np.array(t_bases)
+    return np.array(C_matrices), np.array(C_loss_matrices), np.array(t_bases)
 
 def plot_calibration(scores_dict, ground_truth, attack_dir):
     """
@@ -741,9 +743,55 @@ def plot_bucket_posterior_hist(
 
     plots_dir = os.path.join(attack_dir, "bucket_plots")
     os.makedirs(plots_dir, exist_ok=True)
-    out_path = os.path.join(plots_dir, f"{title_prefix.lower().replace(' ', '_')}_bucket_{bucket_id}_posterior_hist.png")
+    safe_prefix = "".join(c if c.isalnum() or c in "-_" else "_" for c in title_prefix.lower())
+    out_path = os.path.join(plots_dir, f"{safe_prefix}_bucket_{bucket_id}_posterior_hist.png")
     plt.savefig(out_path)
     plt.close()
+
+
+def _plot_bucket_tpr_comparison(
+    scores_dict: dict,
+    bayes_posteriors: np.ndarray,
+    ground_truth: np.ndarray,
+    attack_dir: str,
+    num_buckets: int = 5,
+) -> None:
+    """
+    Bar chart comparing TPR@1%FPR across score-quantile buckets for multiple score types.
+    One grouped bar per bucket, one bar-group colour per score type.
+    """
+    bucket_labels = [f"Q{b}" for b in range(num_buckets)]
+    x = np.arange(num_buckets)
+    width = 0.8 / max(len(scores_dict), 1)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for i, (score_name, scores) in enumerate(scores_dict.items()):
+        quantiles = np.quantile(scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
+        bucket_ids = np.digitize(scores, quantiles)
+        tprs = []
+        for b in range(num_buckets):
+            idx = np.where(bucket_ids == b)[0]
+            if len(idx) < 10:
+                tprs.append(float("nan"))
+                continue
+            fpr, tpr, _ = roc_curve(ground_truth[idx], bayes_posteriors[idx])
+            valid = np.where(fpr <= 0.01)[0]
+            tprs.append(tpr[valid[-1]] * 100 if len(valid) > 0 else float("nan"))
+        offset = (i - (len(scores_dict) - 1) / 2) * width
+        ax.bar(x + offset, tprs, width, label=score_name)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(bucket_labels)
+    ax.set_xlabel("Score quintile bucket")
+    ax.set_ylabel("TPR @ 1% FPR (%)")
+    ax.set_title("Bayesian LiRA TPR@1%FPR by influence-score quintile")
+    ax.legend()
+    ax.axhline(1.0, color="gray", linestyle="--", linewidth=0.8, label="Random (1%)")
+    fig.tight_layout()
+    out_path = os.path.join(attack_dir, "bucket_tpr_comparison.png")
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    print(f"  Saved bucket TPR comparison plot to {out_path}")
 
 
 def analyze_influence_vs_lira(
@@ -756,7 +804,6 @@ def analyze_influence_vs_lira(
     print("\n[Analysis] Influence vs Bayesian LiRA vulnerability")
 
     precomputed_dir = os.path.join(attack_dir, "precomputed_matrices")
-    shadow_models_dir = os.path.join(attack_dir, "shadow_models")
     influence_cache_path = os.path.join(precomputed_dir, "influence_data.npz")
     attack_data_path = os.path.join(attack_dir, "attack_data.npz")
 
@@ -766,29 +813,41 @@ def analyze_influence_vs_lira(
 
     # Load influence matrices and attack data
     influence_data = np.load(influence_cache_path)
-    C_matrices = influence_data["C_matrices"]  # [K, N, N]
+    C_matrices = influence_data["C_matrices"]          # [K, N, N]
+    C_loss_matrices = influence_data["C_loss_matrices"] if "C_loss_matrices" in influence_data else None
 
     attack_data = np.load(attack_data_path)
     query_indices = attack_data["query_indices"]
     ground_truth = attack_data["ground_truth"]
-    N = len(query_indices)
 
-    # --- Score 1: C-based column norm ---
-    C_mean = C_matrices.mean(axis=0)           # [N, N]
-    scores_C = np.linalg.norm(C_mean, axis=0)  # [N]
-    scores_C = (scores_C - scores_C.mean()) / (scores_C.std() + 1e-8)
+    # --- Score: LiRA-vs-loss column norm ---
+    C_mean_lira = C_matrices.mean(axis=0)                      # [N, N]
+    scores_C_lira = np.linalg.norm(C_mean_lira, axis=0)        # [N]
+    scores_C_lira = (scores_C_lira - scores_C_lira.mean()) / (scores_C_lira.std() + 1e-8)
 
-    # --- Score 2: gradient norm on target model ---
+    # --- Score: loss-vs-loss column norm (only if cached) ---
+    if C_loss_matrices is not None:
+        C_mean_loss = C_loss_matrices.mean(axis=0)              # [N, N]
+        scores_C_loss = np.linalg.norm(C_mean_loss, axis=0)    # [N]
+        scores_C_loss = (scores_C_loss - scores_C_loss.mean()) / (scores_C_loss.std() + 1e-8)
+    else:
+        print("  WARNING: C_loss_matrices not found in cache; loss-only score unavailable.")
+        scores_C_loss = None
+
+    # --- Score: gradient norm on target model ---
     print("  Computing gradient-norm scores on target model...")
     scores_grad = compute_grad_norms_last_layer(target_model_path, query_indices, device)
     scores_grad = (scores_grad - scores_grad.mean()) / (scores_grad.std() + 1e-8)
 
+    # Build the dict of scores to analyse (skip loss score if unavailable)
+    scores_dict = {"C-LiRA (lira-vs-loss)": scores_C_lira, "Grad-norm last layer": scores_grad}
+    if scores_C_loss is not None:
+        scores_dict["C-Loss (loss-vs-loss)"] = scores_C_loss
+
     def analyze_score(score_name: str, scores: np.ndarray) -> None:
-        # Global correlation
         corr = np.corrcoef(scores, bayes_posteriors)[0, 1]
         print(f"\n  [{score_name}] Pearson corr(score, Bayesian LiRA posterior): {corr:.3f}")
 
-        # Bucket by score quantiles
         num_buckets = 5
         quantiles = np.quantile(scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
         bucket_ids = np.digitize(scores, quantiles)
@@ -799,14 +858,10 @@ def analyze_influence_vs_lira(
             if len(idx) < 10:
                 print(f"    Bucket {b}: too few points ({len(idx)}), skipping")
                 continue
-
-            # TPR@1% FPR within this bucket
             fpr, tpr, _ = roc_curve(ground_truth[idx], bayes_posteriors[idx])
             valid = np.where(fpr <= 0.01)[0]
             tpr_1pct = tpr[valid[-1]] if len(valid) > 0 else float("nan")
             print(f"    Bucket {b}: size={len(idx)}, TPR@1%FPR={tpr_1pct * 100:.2f}%")
-
-            # Posterior histogram for this bucket
             plot_bucket_posterior_hist(
                 bayes_posteriors=bayes_posteriors,
                 ground_truth=ground_truth,
@@ -816,18 +871,24 @@ def analyze_influence_vs_lira(
                 title_prefix=score_name,
             )
 
-    analyze_score("C-column norm", scores_C)
-    analyze_score("Grad-norm last layer", scores_grad)
+    for name, scores in scores_dict.items():
+        analyze_score(name, scores)
 
-    out_path = os.path.join(attack_dir, "influence_vs_lira_multi.npz")
-    np.savez_compressed(
-        out_path,
-        scores_C=scores_C,
+    # Grouped bar chart comparing all score types side-by-side
+    _plot_bucket_tpr_comparison(scores_dict, bayes_posteriors, ground_truth, attack_dir)
+
+    save_dict = dict(
+        scores_C_lira=scores_C_lira,
         scores_grad=scores_grad,
         bayes_posteriors=bayes_posteriors,
         ground_truth=ground_truth,
         query_indices=query_indices,
     )
+    if scores_C_loss is not None:
+        save_dict["scores_C_loss"] = scores_C_loss
+
+    out_path = os.path.join(attack_dir, "influence_vs_lira_multi.npz")
+    np.savez_compressed(out_path, **save_dict)
     print(f"\n  Saved extended influence analysis data to {out_path}")
 
 def main():
@@ -958,7 +1019,7 @@ def main():
             }, os.path.join(shadow_models_dir, f"shadow_{k}.pth"))
 
         print("Done training/loading shadow models. Now precomputing influence matrices...")
-        C_matrices, t_bases = precompute_influence_matrices(
+        C_matrices, C_loss_matrices, t_bases = precompute_influence_matrices(
             shadow_models=shadow_models,
             shadow_subsets=shadow_subsets,
             query_indices=query_indices,
@@ -968,6 +1029,7 @@ def main():
         np.savez_compressed(
             influence_cache_path,
             C_matrices=C_matrices,
+            C_loss_matrices=C_loss_matrices,
             t_bases=t_bases
         )
         del shadow_models
