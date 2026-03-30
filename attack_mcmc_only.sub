@@ -19,12 +19,12 @@ mkdir -p logs
 REUSE_RUN_DIR="/scratch/scholar/kapur16/attacks/10pct_seed42_overfit"
 
 # MCMC-only rerun (no shadow retraining)
-srun python -u shadow_attack.py \
-    --checkpoint-dir ./checkpoints/10pct_seed42_overfit \
-    --num_shadow_models 64 \
-    --mcmc-steps 50000 \
-    --burn-in 10000 \
-    --prior-prob 0.5 \
-    --temperature 1.0 \
-    --use-final-model \
-    --reuse-attack-run "$REUSE_RUN_DIR"
+python -u shadow_attack.py \
+  --checkpoint-dir ./checkpoints/10pct_seed42_overfit \
+  --num_shadow_models 64 \
+  --num_queries 2000 \
+  --prior-prob 0.5 \
+  --use-final-model \
+  --attack-dir /scratch/scholar/kapur16/attacks \
+  --reuse-attack-run /scratch/scholar/kapur16/attacks/10pct_seed42_overfit \
+  --analyze-influence

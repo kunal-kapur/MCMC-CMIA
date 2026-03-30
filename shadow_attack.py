@@ -20,7 +20,6 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-
 from resnet_influence import ResNet18_Influence
 from train_utils import TrainingConfig, train_shadow_model
 
@@ -496,155 +495,89 @@ def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, attack_dir
 
     return lira_scores, tpr_at_01pct, tpr_at_1pct
 
+def compute_grad_norms_last_layer(model_path, query_indices, device):
+    """
+    Compute per-query L2 norm of the gradient of cross-entropy loss
+    w.r.t. the last linear layer of the target model.
+    Returns an array of shape [N] in the order of query_indices.
+    """
+    from torchvision import datasets
 
-def run_mcmc(target_scores, C_matrices, t_bases, m_actual, output_dir, num_steps=10000, prior_prob=0.5, temperature=0.7, use_influence=True):
-    N = len(target_scores)
-    K = len(C_matrices)
-    global_std = np.std(t_bases, ddof=1) + 1e-8
-    
-    # --- 1. PRECOMPUTE STATIC VARIABLES ONCE ---
-    log_p = np.log(prior_prob + 1e-10)
-    log_1_p = np.log(1 - prior_prob + 1e-10)
-    trace_file_path = os.path.join(output_dir, "mcmc_trace.npy")
-    valid_indices = np.arange(N)
-        
-    C_diag = np.diagonal(C_matrices, axis1=1, axis2=2)
-    in_mask = (m_actual == 1)
-    out_mask = (m_actual == 0)
-    df = (K / 2) - 1
-    
-    # --- 2. INITIALIZE STATE ---
-    M_current = np.random.randint(0, 2, size=N, dtype=np.int8)
-    delta_current = M_current - m_actual
-    
-    # This expensive O(N^2) math happens EXACTLY ONCE
-    if use_influence:
-        t_shifted_current = t_bases + (C_matrices @ delta_current[..., None]).squeeze(-1)
+    model = ResNet18_Influence().to(device)
+    state_dict = torch.load(model_path, map_location=device, weights_only=False)
+    if 'model_state_dict' in state_dict:
+        model.load_state_dict(state_dict['model_state_dict'])
     else:
-        t_shifted_current = t_bases.copy()
+        model.load_state_dict(state_dict)
+    model.eval()
 
-    def compute_log_likelihood(M_prop, t_shifted):
-        """Now takes t_shifted as an argument so we don't recalculate it"""
-        delta = M_prop - m_actual
-        t_isolated = t_shifted - (C_diag * delta)
-        
-        t_in = np.where(in_mask, t_isolated, np.nan)
-        t_out = np.where(out_mask, t_isolated, np.nan)
-        
-        # Suppress RuntimeWarnings for all-NaN slices
-        with np.errstate(invalid='ignore'):
-            mu_in = np.nanmean(t_in, axis=0)   
-            mu_out = np.nanmean(t_out, axis=0) 
-            std_in = np.nanstd(t_in, axis=0, ddof=1)
-            std_out = np.nanstd(t_out, axis=0, ddof=1)
-        
-        std_in = np.where(np.isnan(std_in) | (std_in == 0), global_std, std_in)
-        std_out = np.where(np.isnan(std_out) | (std_out == 0), global_std, std_out)
-        
-        mu_target = np.where(M_prop == 1, mu_in, mu_out)
-        std_target = np.where(M_prop == 1, std_in, std_out)
-        
-        log_liks = t.logpdf(target_scores, df=df, loc=mu_target, scale=std_target)
-        return np.sum(log_liks / temperature)
+    full_dataset = datasets.CIFAR10(root=DATA_DIR, train=True, download=False, transform=TRANSFORM_TEST)
+    query_subset = Subset(full_dataset, [int(idx) for idx in query_indices])
+    loader = DataLoader(query_subset, batch_size=64, shuffle=False)
 
-    def compute_log_prior(M):
-        return np.sum(M * log_p + (1 - M) * log_1_p)
-    
-    current_log_lik = compute_log_likelihood(M_current, t_shifted_current)
-    current_log_prior = compute_log_prior(M_current)
-    current_log_posterior = current_log_lik + current_log_prior
-    
-    # We use 'ab' (append binary) so we can write raw bytes continuously
-    trace_file = open(trace_file_path, "wb")
-    accepted_count = 0
-    
-    # --- 3. MCMC LOOP ---
-    for step in range(num_steps):
-        flip_idx = np.random.choice(valid_indices)
-        
-        # 1. Flip the bit
-        M_prop = M_current.copy()
-        M_prop[flip_idx] = 1 - M_prop[flip_idx]
-        
-        # 2. Incrementally update t_shifted in O(N) time!
-        # If we flipped 0 -> 1, delta increased by 1. If 1 -> 0, delta decreased by 1.
-        flip_direction = 1 if M_prop[flip_idx] == 1 else -1
-        if use_influence:
-            t_shifted_prop = t_shifted_current + (flip_direction * C_matrices[:, :, flip_idx])
-        else:
-            t_shifted_prop = t_shifted_current
-        
-        # 3. Compute new probabilities
-        prop_log_lik = compute_log_likelihood(M_prop, t_shifted_prop)
-        prop_log_prior = current_log_prior + flip_direction * (log_p - log_1_p) # O(1) prior update
-        prop_log_posterior = prop_log_lik + prop_log_prior
-        
-        log_alpha = prop_log_posterior - current_log_posterior
-        if np.isnan(log_alpha):
-            log_alpha = -np.inf
-            
-        with np.errstate(over='ignore'):
-            alpha = np.exp(np.float64(log_alpha))
-            if np.isinf(alpha):
-                alpha = 1.0
-        alpha = min(1.0, alpha)
-        
-        # Accept/Reject
-        if np.random.uniform(0, 1) < alpha:
-            M_current = M_prop
-            t_shifted_current = t_shifted_prop
-            current_log_lik = prop_log_lik
-            current_log_prior = prop_log_prior
-            current_log_posterior = prop_log_posterior
-            accepted_count += 1
+    criterion = torch.nn.CrossEntropyLoss(reduction='none')
 
-        # Store sample in pre-allocated array
-        
-        trace_file.write(M_current.astype(np.int8).tobytes())
-        
-        if (step + 1) % 1000 == 0:
-            print(f"  [MCMC] Step {step+1}/{num_steps} | Acceptance Rate: {accepted_count/(step+1):.2f}", flush=True)
-            # Flush to disk every 1000 steps so it's safe if the job dies
-            trace_file.flush()
-            os.fsync(trace_file.fileno())
+    all_scores = []
 
-    trace_file.close()
-    return trace_file_path
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        logits = model(x)
+        losses = criterion(logits, y)  # [B]
+
+        for i in range(x.size(0)):
+            model.zero_grad(set_to_none=True)
+            losses[i].backward(retain_graph=True)
+
+            grads = []
+            for p in model.linear.parameters():
+                if p.grad is not None:
+                    grads.append(p.grad.detach().reshape(-1))
+            if grads:
+                g_flat = torch.cat(grads)
+                all_scores.append(g_flat.norm().item())
+            else:
+                all_scores.append(0.0)
+
+    return np.array(all_scores, dtype=np.float64)
 
 
 
-def aggregate_posterior(trace_path, num_points=2000, burn_in=200000):
+def aggregate_posterior(trace_path, num_points, burn_in):
     """
     Reads the binary MCMC trace from disk and computes the posterior probability 
     and standard deviation for each point.
+
+    Args:
+        trace_path: path to the .npy trace file written by run_mcmc
+        num_points: number of query points (N)
+        burn_in: number of initial MCMC steps to discard
     """
     if not os.path.exists(trace_path):
         raise FileNotFoundError(f"MCMC trace file not found: {trace_path}")
 
-    # 1. Map the raw bytes from disk into a virtual 1D NumPy array (0 memory overhead)
+    # 1. Map the raw bytes from disk into a virtual 1D NumPy array
     trace_map = np.memmap(trace_path, dtype=np.int8, mode='r')
-    
-    # 2. Automatically detect how many steps were actually written to the file
-    # This prevents errors if the job was OOM-killed early!
+
+    # 2. Detect how many steps were actually written
     total_steps = len(trace_map) // num_points
     print(f"Aggregating {total_steps} recorded MCMC steps...")
-    
-    # 3. Reshape the 1D array into a 2D matrix: (Total Steps, Query Points)
+
+    # 3. Reshape into (Total Steps, Num Points)
     samples = trace_map.reshape((total_steps, num_points))
-    
+
     # 4. Handle edge cases where burn-in is too long
     if burn_in >= total_steps:
         print("WARNING: Run crashed before burn-in finished! Using last 10% of samples.")
         burn_in = int(total_steps * 0.9)
-        
+
     valid_samples = samples[burn_in:]
-    
+
     # 5. Calculate probabilities and standard deviations 
-    # Use dtype=np.float32 to save RAM during the aggregation math
     posterior_probs = np.mean(valid_samples, axis=0, dtype=np.float32)
     posterior_std = np.std(valid_samples, axis=0, dtype=np.float32)
-    
+
     return posterior_probs, posterior_std
+
 
 
 def save_attack_inputs(attack_dir, query_indices, ground_truth):
@@ -710,42 +643,212 @@ def setup_query_points(meta_path, num_queries=1000, total_dataset_size=50000, me
     ground_truth = np.array([1 if idx in true_members else 0 for idx in query_indices])
     return query_indices, ground_truth
 
+def run_bayesian_lira(target_scores, t_bases, m_actual, ground_truth, prior_prob, target_fprs=(0.001, 0.01)):
+    N = len(target_scores)
+    K = len(t_bases)
+    global_std = np.std(t_bases, ddof=1) + 1e-8
 
+    posteriors = np.zeros(N, dtype=np.float64)
+
+    for i in range(N):
+        in_scores  = t_bases[m_actual[:, i] == 1, i]
+        out_scores = t_bases[m_actual[:, i] == 0, i]
+
+        mu_in  = np.mean(in_scores)  if len(in_scores)  > 0 else 0.0
+        mu_out = np.mean(out_scores) if len(out_scores) > 0 else 0.0
+        std_in  = np.std(in_scores,  ddof=1) if len(in_scores)  > 1 else global_std
+        std_out = np.std(out_scores, ddof=1) if len(out_scores) > 1 else global_std
+        std_in  = std_in  if std_in  > 0 else global_std
+        std_out = std_out if std_out > 0 else global_std
+
+        t_i = target_scores[i]
+
+        log_p_in  = norm.logpdf(t_i, loc=mu_in,  scale=std_in)
+        log_p_out = norm.logpdf(t_i, loc=mu_out, scale=std_out)
+
+        log_prior_in  = np.log(prior_prob + 1e-12)
+        log_prior_out = np.log(1 - prior_prob + 1e-12)
+
+        log_num = log_prior_in + log_p_in
+        m = max(log_prior_in + log_p_in, log_prior_out + log_p_out)
+        log_den = m + np.log(
+            np.exp(log_prior_in + log_p_in - m) +
+            np.exp(log_prior_out + log_p_out - m)
+        )
+
+        posteriors[i] = np.exp(log_num - log_den)
+
+    fpr_curve, tpr_curve, _ = roc_curve(ground_truth, posteriors)
+    tprs = {}
+    for fpr_target in target_fprs:
+        valid = np.where(fpr_curve <= fpr_target)[0]
+        tprs[fpr_target] = tpr_curve[valid[-1]] if len(valid) > 0 else float('nan')
+    return posteriors, tprs
+
+
+def per_point_influence_norms(model, dataloader, criterion, device):
+    model.eval()
+    norms = []
+    with torch.no_grad():
+        for x, y in dataloader:
+            x, y = x.to(device), y.to(device)
+            logits, feats = model(x, return_features=True)
+            loss = criterion(logits, y)
+            # gradient wrt last layer weights (per batch)
+            grads = torch.autograd.grad(loss, model.linear.parameters(), retain_graph=False, create_graph=False)
+            g_flat = torch.cat([g.reshape(g.size(0), -1) for g in grads], dim=1)  # [B, P]
+            batch_norms = g_flat.norm(dim=1).cpu().numpy()
+            norms.extend(batch_norms)
+    return np.array(norms)
+
+def plot_bucket_posterior_hist(
+    bayes_posteriors: np.ndarray,
+    ground_truth: np.ndarray,
+    bucket_indices: np.ndarray,
+    bucket_id: int,
+    attack_dir: str,
+    title_prefix: str = "",
+) -> None:
+    """
+    Plot histogram of Bayesian LiRA posteriors in a given bucket,
+    split by members vs non-members.
+    """
+    bucket_post = bayes_posteriors[bucket_indices]
+    bucket_gt   = ground_truth[bucket_indices]
+
+    in_mask  = bucket_gt == 1
+    out_mask = bucket_gt == 0
+
+    in_vals  = bucket_post[in_mask]
+    out_vals = bucket_post[out_mask]
+
+    plt.figure(figsize=(6, 4))
+    bins = np.linspace(0.0, 1.0, 41)
+
+    if len(out_vals) > 0:
+        plt.hist(out_vals, bins=bins, alpha=0.6, label="Non-members",
+                 color="tab:blue", density=True)
+    if len(in_vals) > 0:
+        plt.hist(in_vals, bins=bins, alpha=0.6, label="Members",
+                 color="tab:orange", density=True)
+
+    plt.xlabel("Bayesian LiRA posterior")
+    plt.ylabel("Density")
+    prefix = f"{title_prefix} " if title_prefix else ""
+    plt.title(f"{prefix}Bucket {bucket_id} (n={len(bucket_indices)})")
+    plt.legend()
+    plt.tight_layout()
+
+    plots_dir = os.path.join(attack_dir, "bucket_plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    out_path = os.path.join(plots_dir, f"{title_prefix.lower().replace(' ', '_')}_bucket_{bucket_id}_posterior_hist.png")
+    plt.savefig(out_path)
+    plt.close()
+
+
+def analyze_influence_vs_lira(
+    attack_dir: str,
+    bayes_posteriors: np.ndarray,
+    ground_truth: np.ndarray,
+    target_model_path: str,
+    device,
+):
+    print("\n[Analysis] Influence vs Bayesian LiRA vulnerability")
+
+    precomputed_dir = os.path.join(attack_dir, "precomputed_matrices")
+    shadow_models_dir = os.path.join(attack_dir, "shadow_models")
+    influence_cache_path = os.path.join(precomputed_dir, "influence_data.npz")
+    attack_data_path = os.path.join(attack_dir, "attack_data.npz")
+
+    if not (os.path.exists(influence_cache_path) and os.path.exists(attack_data_path)):
+        print("  Missing influence or attack artifacts; skipping analysis.")
+        return
+
+    # Load influence matrices and attack data
+    influence_data = np.load(influence_cache_path)
+    C_matrices = influence_data["C_matrices"]  # [K, N, N]
+
+    attack_data = np.load(attack_data_path)
+    query_indices = attack_data["query_indices"]
+    ground_truth = attack_data["ground_truth"]
+    N = len(query_indices)
+
+    # --- Score 1: C-based column norm ---
+    C_mean = C_matrices.mean(axis=0)           # [N, N]
+    scores_C = np.linalg.norm(C_mean, axis=0)  # [N]
+    scores_C = (scores_C - scores_C.mean()) / (scores_C.std() + 1e-8)
+
+    # --- Score 2: gradient norm on target model ---
+    print("  Computing gradient-norm scores on target model...")
+    scores_grad = compute_grad_norms_last_layer(target_model_path, query_indices, device)
+    scores_grad = (scores_grad - scores_grad.mean()) / (scores_grad.std() + 1e-8)
+
+    def analyze_score(score_name: str, scores: np.ndarray) -> None:
+        # Global correlation
+        corr = np.corrcoef(scores, bayes_posteriors)[0, 1]
+        print(f"\n  [{score_name}] Pearson corr(score, Bayesian LiRA posterior): {corr:.3f}")
+
+        # Bucket by score quantiles
+        num_buckets = 5
+        quantiles = np.quantile(scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
+        bucket_ids = np.digitize(scores, quantiles)
+
+        print(f"  [{score_name}] Bucketed TPR@1%FPR by quintile:")
+        for b in range(num_buckets):
+            idx = np.where(bucket_ids == b)[0]
+            if len(idx) < 10:
+                print(f"    Bucket {b}: too few points ({len(idx)}), skipping")
+                continue
+
+            # TPR@1% FPR within this bucket
+            fpr, tpr, _ = roc_curve(ground_truth[idx], bayes_posteriors[idx])
+            valid = np.where(fpr <= 0.01)[0]
+            tpr_1pct = tpr[valid[-1]] if len(valid) > 0 else float("nan")
+            print(f"    Bucket {b}: size={len(idx)}, TPR@1%FPR={tpr_1pct * 100:.2f}%")
+
+            # Posterior histogram for this bucket
+            plot_bucket_posterior_hist(
+                bayes_posteriors=bayes_posteriors,
+                ground_truth=ground_truth,
+                bucket_indices=idx,
+                bucket_id=b,
+                attack_dir=attack_dir,
+                title_prefix=score_name,
+            )
+
+    analyze_score("C-column norm", scores_C)
+    analyze_score("Grad-norm last layer", scores_grad)
+
+    out_path = os.path.join(attack_dir, "influence_vs_lira_multi.npz")
+    np.savez_compressed(
+        out_path,
+        scores_C=scores_C,
+        scores_grad=scores_grad,
+        bayes_posteriors=bayes_posteriors,
+        ground_truth=ground_truth,
+        query_indices=query_indices,
+    )
+    print(f"\n  Saved extended influence analysis data to {out_path}")
 
 def main():
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='MCMC-based Membership Inference Attack')
-    parser.add_argument('--num_queries', type=int, default=1000,
-                        help='Number of query points to attack (default: 1000)')
-    parser.add_argument('--num_shadow_models', type=int, default=16,
-                        help='Number of shadow models to train (default: 16)')
-    parser.add_argument('--checkpoint-dir', type=str, required=True,
-                        help='Directory containing the target model checkpoint and metadata')
-    parser.add_argument('--prior-prob', type=float, required=True, help='Adversary\'s prior probability that any given point is a member, useful for preventing FP')
-    parser.add_argument('--use-final-model', action='store_true',
-                        help='Use final model instead of best model')
-    parser.add_argument('--member-percentage', type=float, default=0.5,
-                        help='Percentage of query points that are true members (default: 0.5 for 50%%)')
-    parser.add_argument('--mcmc-steps', type=int, default=10000,
-                        help='Number of MCMC steps (default: 10000)')
-    parser.add_argument('--burn-in', type=int, default=2000,
-                        help='Number of burn-in samples to discard when aggregating posterior (default: 2000)')
-    parser.add_argument('--shadow-epochs', type=int, default=None,
-                        help='Number of epochs to train shadow models (default: use target model epochs from metadata)')
-    parser.add_argument('--temperature', type=float, default=0.7,
-                        help='Temperature scaling for likelihood computation (default: 0.7)')
-    parser.add_argument('--attack-dir', type=str, default="attacks",
-                        help='Base directory to store attack results (default: attacks)')
-    parser.add_argument('--reuse-attack-run', type=str, default=None,
-                        help='Reuse an existing attack run directory and skip shadow retraining/influence precompute')
-    parser.add_argument('--ablate-influence', action='store_true',
-                        help='Debug ablation: disable influence matrix C so MCMC runs on raw LiRA scores only')
-
-    
+    # 1. Parse arguments (unchanged, but you can drop MCMC-only flags if you want)
+    parser = argparse.ArgumentParser(description='LiRA-based Membership Inference Attack')
+    parser.add_argument('--num_queries', type=int, default=1000)
+    parser.add_argument('--num_shadow_models', type=int, default=16)
+    parser.add_argument('--checkpoint-dir', type=str, required=True)
+    parser.add_argument('--prior-prob', type=float, required=True)
+    parser.add_argument('--use-final-model', action='store_true')
+    parser.add_argument('--member-percentage', type=float, default=0.5)
+    parser.add_argument('--shadow-epochs', type=int, default=None)
+    parser.add_argument('--attack-dir', type=str, default="attacks")
+    parser.add_argument('--reuse-attack-run', type=str, default=None)
+    parser.add_argument('--analyze-influence', action='store_true',
+                    help='Run influence vs LiRA vulnerability analysis')
     args = parser.parse_args()
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # 2. Set up attack directory and load metadata (same as before)
     reuse_mode = args.reuse_attack_run is not None
     checkpoint_dir = args.checkpoint_dir
     model_name = os.path.basename(checkpoint_dir.rstrip("/"))
@@ -756,8 +859,8 @@ def main():
             raise FileNotFoundError(f"Reuse run directory not found: {attack_dir}")
     else:
         attack_dir = setup_attack_directory(base_dir=args.attack_dir, model_name=model_name)
-    meta_path = os.path.join(checkpoint_dir, "training_metadata.json")
 
+    meta_path = os.path.join(checkpoint_dir, "training_metadata.json")
     if not os.path.exists(meta_path):
         raise FileNotFoundError(f"Metadata file not found: {meta_path}")
 
@@ -765,18 +868,12 @@ def main():
     model_files = [f for f in os.listdir(checkpoint_dir) if f.endswith(f"_{model_suffix}.pth")]
     if not model_files:
         raise FileNotFoundError(f"No model file found with suffix '{model_suffix}' in {checkpoint_dir}")
-
     target_model_path = os.path.join(checkpoint_dir, model_files[0])
 
     print(f"Loading target model from: {target_model_path}")
     print(f"Loading metadata from: {meta_path}")
 
-    NUM_SHADOW_MODELS = args.num_shadow_models
-    MCMC_STEPS = args.mcmc_steps
-    BURN_IN = args.burn_in
-    PRIOR_PROB = args.prior_prob
-    TEMPERATURE = args.temperature
-
+    # 3. Query selection and attack inputs
     attack_data_path = os.path.join(attack_dir, 'attack_data.npz')
     if reuse_mode or os.path.exists(attack_data_path):
         query_indices, ground_truth = load_attack_inputs(attack_dir)
@@ -792,46 +889,12 @@ def main():
         )
         save_attack_inputs(attack_dir, query_indices, ground_truth)
 
-    print(f"Attack configuration:")
-    print(f"  - Checkpoint Directory: {checkpoint_dir}")
-    print(f"  - Target Model: {target_model_path}")
-    print(f"  - Attack Directory: {attack_dir}")
-    print(f"  - Reuse Existing Run: {'yes' if reuse_mode else 'no'}")
-    print(f"  - Num Queries: {NUM_QUERIES}")
-    print(f"  - Num Shadow Models: {NUM_SHADOW_MODELS}")
-    print(f"  - Prior Membership Probability: {PRIOR_PROB:.4f}")
-    print(f"  - MCMC Steps: {MCMC_STEPS}")
-    print(f"  - Burn-in: {BURN_IN}")
-    print(f"  - Temperature: {TEMPERATURE}")
-    print(f"  - Target FPRs: 0.1%, 1.0%")
-    if not reuse_mode:
-        print(f"  - Member Percentage: {args.member_percentage * 100:.1f}%")
-    
-    # Load target metadata for dataset sizes and training configuration
+    # 4. Load training config, train/reuse shadow models, precompute influence matrices
     with open(meta_path, 'r') as f:
         meta = json.load(f)
-    
     TOTAL_DATASET_SIZE = meta['total_cifar10_train_size']
     TARGET_TRAIN_SIZE = meta['num_samples_used']
-    
-    training_config = None
-    if not reuse_mode:
-        # Load training configuration from metadata
-        print(f"\nLoading training configuration from metadata...")
-        training_config = TrainingConfig.from_metadata(meta_path)
 
-        # Override epochs if specified
-        if args.shadow_epochs is not None:
-            print(f"  Overriding epochs: {training_config.epochs} -> {args.shadow_epochs}")
-            training_config.epochs = args.shadow_epochs
-
-        print(f"  Shadow models will use:")
-        print(f"    - Optimizer: {training_config.optimizer_type.upper()}")
-        print(f"    - Learning rate: {training_config.lr}")
-        print(f"    - Epochs: {training_config.epochs}")
-        print(f"    - Batch size: {training_config.batch_size}")
-        print(f"    - Scheduler: {training_config.scheduler_type}")
-    
     print(f"\nTarget model was trained on {TARGET_TRAIN_SIZE} samples out of {TOTAL_DATASET_SIZE}.")
     print(f"Starting attack on {len(query_indices)} points.")
     print(f"Number of true members in query set: {np.sum(ground_truth)}")
@@ -858,19 +921,26 @@ def main():
 
         print(f"Reusing cached shadow artifacts from {attack_dir}...")
         influence_data = np.load(influence_cache_path)
-        C_matrices = influence_data['C_matrices']
+        C_matrices = influence_data['C_matrices']   # still available for later analysis
         t_bases = influence_data['t_bases']
         m_actual = np.load(m_actual_path)
-
-        if m_actual.shape[1] != len(query_indices):
-            raise ValueError(
-                f"Mismatch between cached memberships ({m_actual.shape[1]} points) and "
-                f"attack_data.npz ({len(query_indices)} points)."
-            )
     else:
+        print(f"\nLoading training configuration from metadata...")
+        training_config = TrainingConfig.from_metadata(meta_path)
+        if args.shadow_epochs is not None:
+            print(f"  Overriding epochs: {training_config.epochs} -> {args.shadow_epochs}")
+            training_config.epochs = args.shadow_epochs
+
+        print(f"  Shadow models will use:")
+        print(f"    - Optimizer: {training_config.optimizer_type.upper()}")
+        print(f"    - Learning rate: {training_config.lr}")
+        print(f"    - Epochs: {training_config.epochs}")
+        print(f"    - Batch size: {training_config.batch_size}")
+        print(f"    - Scheduler: {training_config.scheduler_type}")
+
         shadow_models, m_actual, shadow_subsets, any_new_models_trained = train_shadow_models(
             query_indices=query_indices,
-            num_models=NUM_SHADOW_MODELS,
+            num_models=args.num_shadow_models,
             total_dataset_size=TOTAL_DATASET_SIZE,
             target_train_size=TARGET_TRAIN_SIZE,
             training_config=training_config,
@@ -887,68 +957,30 @@ def main():
                 'subset_indices': shadow_subsets[k]
             }, os.path.join(shadow_models_dir, f"shadow_{k}.pth"))
 
-        if (not any_new_models_trained) and os.path.exists(influence_cache_path):
-            print(f"Done loading shadow models. Reusing cached influence data from {influence_cache_path}...")
-            influence_data = np.load(influence_cache_path)
-            C_matrices = influence_data['C_matrices']
-            t_bases = influence_data['t_bases']
-        else:
-            print("Done training/loading shadow models. Now precomputing influence matrices...")
-            C_matrices, t_bases = precompute_influence_matrices(
-                shadow_models=shadow_models,
-                shadow_subsets=shadow_subsets,
-                query_indices=query_indices,
-                device=device,
-                hessian_sample_size=5000
-            )
-
-            np.savez_compressed(
-                influence_cache_path,
-                C_matrices=C_matrices,
-                t_bases=t_bases
-            )
-
+        print("Done training/loading shadow models. Now precomputing influence matrices...")
+        C_matrices, t_bases = precompute_influence_matrices(
+            shadow_models=shadow_models,
+            shadow_subsets=shadow_subsets,
+            query_indices=query_indices,
+            device=device,
+            hessian_sample_size=5000,
+        )
+        np.savez_compressed(
+            influence_cache_path,
+            C_matrices=C_matrices,
+            t_bases=t_bases
+        )
         del shadow_models
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    # 5. Evaluate target model on query points
     print("Evaluating target model on query points...")
     target_scores = evaluate_target_model(target_model_path, query_indices, device)
 
-    use_influence = not args.ablate_influence
-    mcmc_label = "MCMC-CMIA" if use_influence else "MCMC (no-C ablation)"
-    print(f"Running MCMC for {NUM_QUERIES} points (use_influence={use_influence})...")
-    trace_path = run_mcmc(
-        target_scores=target_scores,
-        C_matrices=C_matrices,
-        t_bases=t_bases,
-        m_actual=m_actual,
-        output_dir=attack_dir,
-        num_steps=MCMC_STEPS,
-        prior_prob=PRIOR_PROB,
-        temperature=TEMPERATURE,
-        use_influence=use_influence,
-    )
-
-    posterior_probs, posterior_std = aggregate_posterior(
-        trace_path,
-        num_points=len(target_scores),
-        burn_in=BURN_IN
-    )
-
-    posterior_dict = {str(q_idx): float(prob) for q_idx, prob in zip(query_indices, posterior_probs)}
-    with open(os.path.join(attack_dir, "posterior_probs.json"), "w") as f:
-        json.dump(posterior_dict, f, indent=2)
-
-    np.save(os.path.join(attack_dir, "posterior_std.npy"), posterior_std)
-
-    fpr_curve, tpr_curve, _ = roc_curve(ground_truth, posterior_probs)
-    valid_01 = np.where(fpr_curve <= 0.001)[0]
-    mcmc_tpr_01pct = tpr_curve[valid_01[-1]] if len(valid_01) > 0 else float('nan')
-    valid_1 = np.where(fpr_curve <= 0.01)[0]
-    mcmc_tpr_1pct = tpr_curve[valid_1[-1]] if len(valid_1) > 0 else float('nan')
-
+    # 6. LiRA baseline (unchanged)
+    TARGET_FPRS = (0.001, 0.01)
     lira_scores, lira_tpr_01pct, lira_tpr_1pct = run_lira_baseline(
         target_scores,
         t_bases,
@@ -957,17 +989,43 @@ def main():
         attack_dir,
     )
 
+    # 7. Bayesian LiRA (per-point posterior)
+    print("Running Bayesian LiRA (per-point posterior)...")
+    bayes_posteriors, bayes_tprs = run_bayesian_lira(
+        target_scores=target_scores,
+        t_bases=t_bases,
+        m_actual=m_actual,
+        ground_truth=ground_truth,
+        prior_prob=args.prior_prob,
+        target_fprs=TARGET_FPRS,
+    )
+    if args.analyze_influence:
+        analyze_influence_vs_lira(
+            attack_dir=attack_dir,
+            bayes_posteriors=bayes_posteriors,
+            ground_truth=ground_truth,
+            target_model_path=target_model_path,
+            device=device,
+        )
+    # 8. Calibration / plots
     plot_calibration(
-        {mcmc_label: posterior_probs, "LiRA (control)": lira_scores},
+        {
+            "LiRA (control)": lira_scores,
+            "Bayesian LiRA": bayes_posteriors,
+        },
         ground_truth,
         attack_dir,
     )
 
+    # 9. Final printout
+    bayes_tpr_01pct = bayes_tprs[0.001]
+    bayes_tpr_1pct  = bayes_tprs[0.01]
+
     print(f"\n{'='*80}")
     print(f"FINAL COMPARISON")
     print(f"{'='*80}")
-    print(f"  {mcmc_label}:  TPR @ 0.1% FPR = {mcmc_tpr_01pct * 100:.2f}%  |  TPR @ 1% FPR = {mcmc_tpr_1pct * 100:.2f}%")
-    print(f"  LiRA (control): TPR @ 0.1% FPR = {lira_tpr_01pct * 100:.2f}%  |  TPR @ 1% FPR = {lira_tpr_1pct * 100:.2f}%")
+    print(f"  LiRA (control):    TPR @ 0.1% FPR = {lira_tpr_01pct * 100:.2f}%  |  TPR @ 1% FPR = {lira_tpr_1pct * 100:.2f}%")
+    print(f"  Bayesian LiRA:     TPR @ 0.1% FPR = {bayes_tpr_01pct * 100:.2f}%  |  TPR @ 1% FPR = {bayes_tpr_1pct * 100:.2f}%")
     print(f"{'='*80}\n")
 
 if __name__ == "__main__":
