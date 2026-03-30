@@ -544,41 +544,6 @@ def compute_grad_norms_last_layer(model_path, query_indices, device):
 
 
 
-def aggregate_posterior(trace_path, num_points, burn_in):
-    """
-    Reads the binary MCMC trace from disk and computes the posterior probability 
-    and standard deviation for each point.
-
-    Args:
-        trace_path: path to the .npy trace file written by run_mcmc
-        num_points: number of query points (N)
-        burn_in: number of initial MCMC steps to discard
-    """
-    if not os.path.exists(trace_path):
-        raise FileNotFoundError(f"MCMC trace file not found: {trace_path}")
-
-    # 1. Map the raw bytes from disk into a virtual 1D NumPy array
-    trace_map = np.memmap(trace_path, dtype=np.int8, mode='r')
-
-    # 2. Detect how many steps were actually written
-    total_steps = len(trace_map) // num_points
-    print(f"Aggregating {total_steps} recorded MCMC steps...")
-
-    # 3. Reshape into (Total Steps, Num Points)
-    samples = trace_map.reshape((total_steps, num_points))
-
-    # 4. Handle edge cases where burn-in is too long
-    if burn_in >= total_steps:
-        print("WARNING: Run crashed before burn-in finished! Using last 10% of samples.")
-        burn_in = int(total_steps * 0.9)
-
-    valid_samples = samples[burn_in:]
-
-    # 5. Calculate probabilities and standard deviations 
-    posterior_probs = np.mean(valid_samples, axis=0, dtype=np.float32)
-    posterior_std = np.std(valid_samples, axis=0, dtype=np.float32)
-
-    return posterior_probs, posterior_std
 
 
 
@@ -598,7 +563,7 @@ def load_attack_inputs(attack_dir):
     if not os.path.exists(attack_data_path):
         raise FileNotFoundError(
             f"Missing attack data file: {attack_data_path}. "
-            "Cannot reuse this run for MCMC-only execution."
+            "Run without --reuse-attack-run once to build shadow models/influence matrices first."
         )
 
     attack_data = np.load(attack_data_path)
@@ -892,7 +857,7 @@ def analyze_influence_vs_lira(
     print(f"\n  Saved extended influence analysis data to {out_path}")
 
 def main():
-    # 1. Parse arguments (unchanged, but you can drop MCMC-only flags if you want)
+    # 1. Parse arguments
     parser = argparse.ArgumentParser(description='LiRA-based Membership Inference Attack')
     parser.add_argument('--num_queries', type=int, default=1000)
     parser.add_argument('--num_shadow_models', type=int, default=16)
