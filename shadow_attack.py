@@ -336,14 +336,17 @@ def train_shadow_models(query_indices, num_models, total_dataset_size, target_tr
     return shadow_models, np.array(shadow_datasets_m), shadow_subsets, any_new_models_trained
 
 
-def precompute_influence_matrices(shadow_models, shadow_subsets, query_indices, device, hessian_sample_size=3000):
+def precompute_influence_matrices(shadow_models, shadow_subsets, query_indices, device,
+                                  hessian_sample_size=3000, save_dir=None):
     """
-    Calculate Hessian and both Influence matrices (LiRA-vs-loss and loss-vs-loss)
-    using a subsampled Hessian for speed.
-    Note: shadow_subsets MUST be the list of exact index arrays each model was trained on.
+    Calculate Hessian and both Influence matrices (LiRA-vs-loss and loss-vs-loss).
+
+    Matrices are written to disk one at a time (save_dir/C_k.npy, C_loss_k.npy) to
+    avoid accumulating [K, N, N] arrays in RAM.  Only t_bases (tiny) is kept in memory.
+
+    Returns t_bases as [K, N] numpy array.  C_matrices and C_loss_matrices are NOT
+    returned — callers should load them from disk via save_dir.
     """
-    C_matrices = []
-    C_loss_matrices = []
     t_bases = []
 
     full_dataset = datasets.CIFAR10(root=DATA_DIR, train=True, download=False, transform=TRANSFORM_TEST)
@@ -352,40 +355,68 @@ def precompute_influence_matrices(shadow_models, shadow_subsets, query_indices, 
         print(f"  -> Precomputing Influence for Shadow Model {k+1}/{len(shadow_models)}...")
         model = model.to(device)
 
-        # 1. FAST HESSIAN APPROXIMATION
         train_indices = shadow_subsets[k]
-
-        # Randomly subsample the training set to compute the Hessian quickly
         sample_size = min(hessian_sample_size, len(train_indices))
         hessian_indices = np.random.choice(train_indices, sample_size, replace=False)
-        hessian_subset = Subset(full_dataset, hessian_indices)
+        hessian_loader = DataLoader(
+            Subset(full_dataset, hessian_indices), batch_size=256, shuffle=False, num_workers=0
+        )
 
-        hessian_loader = DataLoader(hessian_subset, batch_size=256, shuffle=False, num_workers=0)
-
-        # Compute H on the subsample
         H = model.compute_last_layer_hessian(hessian_loader, device)
         H_inv = torch.linalg.inv(H)
 
-        # 2. INFLUENCE MATRICES FOR QUERY POINTS ONLY
-        query_subset = Subset(full_dataset, [int(idx) for idx in query_indices])
-        query_loader = DataLoader(query_subset, batch_size=256, shuffle=False)
+        query_loader = DataLoader(
+            Subset(full_dataset, [int(idx) for idx in query_indices]), batch_size=256, shuffle=False
+        )
 
-        # Pass the TRUE train size (len(train_indices)), not the subsample size,
-        # to ensure the 1/N scaling is mathematically correct
         train_size = len(train_indices)
         C, C_loss = model.compute_influence_matrices(query_loader, H_inv, train_size, device)
-        C_matrices.append(C.cpu().numpy())
-        C_loss_matrices.append(C_loss.cpu().numpy())
 
-        t_base = model.get_lira_statistics(query_loader, device)
-        t_bases.append(t_base.cpu().numpy())
+        # Write each matrix to disk immediately — never accumulate [K, N, N] in RAM
+        if save_dir is not None:
+            np.save(os.path.join(save_dir, f"C_{k}.npy"),      C.cpu().numpy())
+            np.save(os.path.join(save_dir, f"C_loss_{k}.npy"), C_loss.cpu().numpy())
 
-        # memory clean up
+        t_bases.append(model.get_lira_statistics(query_loader, device).cpu().numpy())
+
         model = model.cpu()
         del H, H_inv, C, C_loss
         torch.cuda.empty_cache()
+
     print("done precomputing influence matrices.")
-    return np.array(C_matrices), np.array(C_loss_matrices), np.array(t_bases)
+    return np.array(t_bases)  # [K, N]
+
+
+def _stack_influence_matrices_to_npz(save_dir, num_models, influence_cache_path, t_bases):
+    """
+    Memory-map individual C_k.npy / C_loss_k.npy files and write them into a single
+    compressed npz without ever holding more than one matrix in RAM at a time.
+    """
+    print("  Stacking influence matrices into compressed cache...")
+    # Peek at shape from first file
+    c0 = np.load(os.path.join(save_dir, "C_0.npy"))
+    N = c0.shape[0]
+
+    C_stack      = np.empty((num_models, N, N), dtype=np.float32)
+    C_loss_stack = np.empty((num_models, N, N), dtype=np.float32)
+
+    for k in range(num_models):
+        C_stack[k]      = np.load(os.path.join(save_dir, f"C_{k}.npy"))
+        C_loss_stack[k] = np.load(os.path.join(save_dir, f"C_loss_{k}.npy"))
+
+    np.savez_compressed(
+        influence_cache_path,
+        C_matrices=C_stack,
+        C_loss_matrices=C_loss_stack,
+        t_bases=t_bases,
+    )
+    del C_stack, C_loss_stack
+
+    # Clean up per-model shard files
+    for k in range(num_models):
+        os.remove(os.path.join(save_dir, f"C_{k}.npy"))
+        os.remove(os.path.join(save_dir, f"C_loss_{k}.npy"))
+    print(f"  Saved influence cache to {influence_cache_path}")
 
 def plot_calibration(scores_dict, ground_truth, attack_dir):
     """
@@ -984,23 +1015,25 @@ def main():
             }, os.path.join(shadow_models_dir, f"shadow_{k}.pth"))
 
         print("Done training/loading shadow models. Now precomputing influence matrices...")
-        C_matrices, C_loss_matrices, t_bases = precompute_influence_matrices(
+        t_bases = precompute_influence_matrices(
             shadow_models=shadow_models,
             shadow_subsets=shadow_subsets,
             query_indices=query_indices,
             device=device,
             hessian_sample_size=5000,
-        )
-        np.savez_compressed(
-            influence_cache_path,
-            C_matrices=C_matrices,
-            C_loss_matrices=C_loss_matrices,
-            t_bases=t_bases
+            save_dir=precomputed_dir,
         )
         del shadow_models
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        _stack_influence_matrices_to_npz(
+            save_dir=precomputed_dir,
+            num_models=args.num_shadow_models,
+            influence_cache_path=influence_cache_path,
+            t_bases=t_bases,
+        )
 
     # 5. Evaluate target model on query points
     print("Evaluating target model on query points...")
