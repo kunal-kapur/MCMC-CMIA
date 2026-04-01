@@ -466,6 +466,12 @@ def plot_calibration(scores_dict, ground_truth, attack_dir):
     print(f"Saved calibration plots to {attack_dir}/")
 
 
+def _balanced_accuracy_from_roc(fpr_curve, tpr_curve):
+    """Return the maximum balanced accuracy achievable across all ROC thresholds."""
+    ba_values = (tpr_curve + (1.0 - fpr_curve)) / 2.0
+    return float(np.max(ba_values))
+
+
 def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, attack_dir):
     """
     Standard LiRA (Likelihood Ratio Attack) baseline — no MCMC, no influence functions.
@@ -484,9 +490,10 @@ def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, attack_dir
         attack_dir:    Directory to save results
 
     Returns:
-        lira_scores: Per-point LiRA log-likelihood ratio scores, shape (N,)
-        tpr_at_01pct: TPR at 0.1% FPR
-        tpr_at_1pct:  TPR at 1% FPR
+        lira_scores:    Per-point LiRA log-likelihood ratio scores, shape (N,)
+        tpr_at_01pct:   TPR at 0.1% FPR
+        tpr_at_1pct:    TPR at 1% FPR
+        balanced_acc:   Max balanced accuracy across all thresholds
     """
     N = len(target_scores)
     K = len(t_bases)
@@ -524,8 +531,9 @@ def run_lira_baseline(target_scores, t_bases, m_actual, ground_truth, attack_dir
     tpr_at_01pct = tpr_curve[valid_01[-1]] if len(valid_01) > 0 else float('nan')
     valid_1 = np.where(fpr_curve <= 0.01)[0]
     tpr_at_1pct = tpr_curve[valid_1[-1]] if len(valid_1) > 0 else float('nan')
+    balanced_acc = _balanced_accuracy_from_roc(fpr_curve, tpr_curve)
 
-    return lira_scores, tpr_at_01pct, tpr_at_1pct
+    return lira_scores, tpr_at_01pct, tpr_at_1pct, balanced_acc
 
 def compute_grad_norms_last_layer(model_path, query_indices, device):
     """
@@ -801,7 +809,7 @@ def analyze_influence_vs_lira(
         quantiles = np.quantile(scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
         bucket_ids = np.digitize(scores, quantiles)
 
-        print(f"  [{score_name}] Bucketed TPR@1%FPR by quintile:")
+        print(f"  [{score_name}] Bucketed TPR@1%FPR and Balanced Accuracy by quintile:")
         for b in range(num_buckets):
             idx = np.where(bucket_ids == b)[0]
             if len(idx) < 10:
@@ -810,7 +818,8 @@ def analyze_influence_vs_lira(
             fpr, tpr, _ = roc_curve(ground_truth[idx], lira_scores[idx])
             valid = np.where(fpr <= 0.01)[0]
             tpr_1pct = tpr[valid[-1]] if len(valid) > 0 else float("nan")
-            print(f"    Bucket {b}: size={len(idx)}, TPR@1%FPR={tpr_1pct * 100:.2f}%")
+            bal_acc = _balanced_accuracy_from_roc(fpr, tpr)
+            print(f"    Bucket {b}: size={len(idx)}, TPR@1%FPR={tpr_1pct * 100:.2f}%, Balanced Acc={bal_acc * 100:.2f}%")
             plot_bucket_lira_hist(
                 lira_scores=lira_scores,
                 ground_truth=ground_truth,
@@ -991,7 +1000,7 @@ def main():
     target_scores = evaluate_target_model(target_model_path, query_indices, device)
 
     # 6. LiRA baseline (unchanged)
-    lira_scores, lira_tpr_01pct, lira_tpr_1pct = run_lira_baseline(
+    lira_scores, lira_tpr_01pct, lira_tpr_1pct, lira_balanced_acc = run_lira_baseline(
         target_scores,
         t_bases,
         m_actual,
@@ -1015,7 +1024,7 @@ def main():
     print(f"\n{'='*80}")
     print(f"RESULTS")
     print(f"{'='*80}")
-    print(f"  LiRA:  TPR @ 0.1% FPR = {lira_tpr_01pct * 100:.2f}%  |  TPR @ 1% FPR = {lira_tpr_1pct * 100:.2f}%")
+    print(f"  LiRA:  TPR @ 0.1% FPR = {lira_tpr_01pct * 100:.2f}%  |  TPR @ 1% FPR = {lira_tpr_1pct * 100:.2f}%  |  Balanced Acc = {lira_balanced_acc * 100:.2f}%")
     print(f"{'='*80}\n")
 
 if __name__ == "__main__":
